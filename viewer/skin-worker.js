@@ -1,9 +1,14 @@
 // Runs one team's skin.js in isolation: it only ever sees its own blank OffscreenCanvas and frame data.
 let skin = null;
+let images = {};
 const canvases = {};
 const describe = (err) => String((err && err.stack) || err).split('\n').slice(0, 3).join('\n');
 
 self.onmessage = async ({ data: m }) => {
+  if (m.type === 'images') {
+    images = m.images || {};
+    return;
+  }
   if (m.type === 'load') {
     try {
       const mod = await import(m.url);
@@ -16,6 +21,7 @@ self.onmessage = async ({ data: m }) => {
   }
   if (m.type === 'frame') {
     const f = m.f;
+    f.images = images;
     let c = canvases[f.mode];
     if (!c || c.width !== f.width || c.height !== f.height) c = canvases[f.mode] = new OffscreenCanvas(f.width, f.height);
     const ctx = c.getContext('2d');

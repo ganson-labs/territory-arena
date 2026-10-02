@@ -10,10 +10,57 @@ const ERROR_LIMIT = 5;
 const HANG_MS = 1500;
 const LOAD_MS = 5000;
 
+const SVG_LONG_SIDE = 1280;
+const IMAGES_MS = 8000;
+
+// Rasterise the team's pictures on the page. A picture that fails is skipped, never fatal.
+async function loadImages(assets, errors) {
+  const out = {};
+  const one = async (a) => {
+    try {
+      const r = await fetch(`${a.url}?v=${Date.now()}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      if (a.name.toLowerCase().endsWith('.svg')) {
+        const text = await blob.text();
+        // Size from width/height, else from viewBox: an SVG without them has no natural size.
+        const num = (re) => Number((text.match(re) || [])[1]);
+        const vb = (text.match(/viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i) || []).slice(1).map(Number);
+        let w = num(/<svg[^>]*\swidth\s*=\s*["']?([\d.]+)/i) || vb[0] || 512;
+        let h = num(/<svg[^>]*\sheight\s*=\s*["']?([\d.]+)/i) || vb[1] || w;
+        const k = SVG_LONG_SIDE / Math.max(w, h);
+        w = Math.max(1, Math.round(w * k));
+        h = Math.max(1, Math.round(h * k));
+        const url = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+        try {
+          const img = new Image(w, h);
+          img.src = url;
+          await img.decode();
+          const c = new OffscreenCanvas(w, h);
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          out[a.name] = c.transferToImageBitmap();
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      } else {
+        out[a.name] = await createImageBitmap(blob);
+      }
+    } catch (err) {
+      errors.push(`${a.name}: ${err?.message || err}`);
+      console.warn(`[skin] картинка ${a.name} не загрузилась:`, err);
+    }
+  };
+  await Promise.race([Promise.all(assets.map(one)), new Promise((r) => setTimeout(r, IMAGES_MS))]);
+  return out;
+}
+
 export class SkinHost {
-  constructor(team, url) {
+  constructor(team, url, assets = []) {
     this.team = team; // { name, motto, color, accent }
     this.url = url;
+    this.assets = assets; // [{ name, url }]
+    this.imageErrors = [];
+    this.imageCount = 0;
     this.worker = null;
     this.fallback = !url;
     this.reason = url ? '' : 'нет skin.js';
@@ -47,6 +94,10 @@ export class SkinHost {
     this.worker.onerror = (e) => {
       this.lastError = e.message;
     };
+    // Pictures go first, so the very first draw already has them.
+    const images = await loadImages(this.assets, this.imageErrors);
+    this.imageCount = Object.keys(images).length;
+    this.worker.postMessage({ type: 'images', images }, Object.values(images));
     this.worker.postMessage({ type: 'load', url: `${location.origin}${this.url}?v=${Date.now()}` });
     const r = await loaded;
     if (!r || r.error || !r.hasDraw) {
@@ -141,9 +192,10 @@ export class SkinHost {
   }
 
   status() {
-    if (this.fallback) return `по умолчанию (${this.reason})`;
+    const img = this.assets.length ? `, картинок ${this.imageCount}/${this.assets.length}${this.imageErrors.length ? ` (сбой: ${this.imageErrors[0].slice(0, 50)})` : ''}` : '';
+    if (this.fallback) return `по умолчанию (${this.reason})${img}`;
     const slow = this.slow.reduce((a, b) => a + b, 0);
-    return `облик команды: кадров ${this.frames}, макс ${this.maxMs.toFixed(1)} мс, медленных ${slow}/${this.slow.length}, ошибок ${this.errors}`;
+    return `облик команды: кадров ${this.frames}, макс ${this.maxMs.toFixed(1)} мс, медленных ${slow}/${this.slow.length}, ошибок ${this.errors}${img}`;
   }
 
   dispose() {

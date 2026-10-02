@@ -65,7 +65,10 @@ function showMenu(msg = '', isError = false) {
 }
 
 async function loadBotList() {
-  bots = await (await fetch('/api/bots')).json();
+  // a / b in the link: a contestant id from arena.config.json or an absolute path to its folder.
+  const q = new URLSearchParams();
+  for (const k of ['a', 'b']) if (params.get(k) && /^([a-zA-Z]:)?[\\/]/.test(params.get(k))) q.append('path', params.get(k));
+  bots = await (await fetch(`/api/bots?${q}`)).json();
   for (const sel of [$('#botA'), $('#botB')]) {
     sel.innerHTML = '';
     for (const b of bots) {
@@ -75,7 +78,7 @@ async function loadBotList() {
       sel.appendChild(o);
     }
   }
-  const contest = bots.filter((b) => b.id.startsWith('contestants/'));
+  const contest = bots.filter((b) => !b.id.startsWith('sparring/'));
   $('#botA').value = params.get('a') || contest[0]?.id || 'sparring/farmer';
   $('#botB').value = params.get('b') || contest[1]?.id || 'sparring/raider';
   if (params.get('first')) $('#firstTo').value = params.get('first');
@@ -104,7 +107,7 @@ async function readTeam(entry) {
 async function loadContestant(entry, altColor) {
   const team = await readTeam(entry);
   if (altColor) team.color = altColor;
-  const skin = new SkinHost(team, entry.hasSkin ? `${entry.dir}skin.js` : null);
+  const skin = new SkinHost(team, entry.hasSkin ? `${entry.dir}skin.js` : null, entry.assets || []);
   await skin.start();
   const host = new BotHost(entry);
   try {
