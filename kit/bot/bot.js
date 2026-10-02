@@ -1,18 +1,12 @@
 // Стартовый шаблон. Замени всё: правила и API — в ARENA.md.
-// Сейчас бот просто нарезает квадраты 5x5 вокруг базы и никого не боится.
-
-let step = 0;
+// Сейчас бот выезжает прямо, а вне своей земли закладывает вираж и возвращается.
 
 export default {
   // Необязательно: вызывается в начале каждого раунда.
-  init(info) {
-    step = 0;
-  },
+  init(info) {},
 
-  // Вызывается 10 раз в секунду. Верни 'up' | 'down' | 'left' | 'right' | 'straight'.
+  // Вызывается 20 раз в секунду. Верни { turn: -1..1 } или { heading: градусы }.
   tick(state) {
-    const loop = ['right', 'right', 'right', 'right', 'right', 'down', 'down', 'down', 'down', 'down',
-      'left', 'left', 'left', 'left', 'left', 'up', 'up', 'up', 'up', 'up'];
-    return loop[step++ % loop.length];
+    return { turn: state.me.home ? 0 : 0.7 };
   },
 };

@@ -1,52 +1,63 @@
 // Territory Arena engine. Pure, deterministic, no DOM and no Node APIs:
 // the same file drives the CLI sandbox, the replay tool and the browser viewer.
+//
+// The world is continuous (x, y in units, heading in degrees). Territory and trails
+// are kept on a fine hidden raster of 10x10-unit cells; the viewer draws them as
+// smooth shapes.
 
-export const W = 64;
-export const H = 40;
-export const CELLS = W * H;
-export const TICK_RATE = 10; // ходов в секунду
+export const WIDTH = 1600;
+export const HEIGHT = 1000;
+export const CELL = 10;
+export const COLS = WIDTH / CELL; // 160
+export const ROWS = HEIGHT / CELL; // 100
+export const CELLS = COLS * ROWS;
+export const TICK_RATE = 20;
 export const DT = 1 / TICK_RATE;
 export const ROUND_SECONDS = 120;
 export const ROUND_TICKS = ROUND_SECONDS * TICK_RATE;
+export const SPEED = 200; // units per second
+export const STEP = SPEED * DT; // 10 units per tick
+export const TURN_RATE = 240; // degrees per second
+export const TURN_PER_TICK = TURN_RATE * DT; // 12 degrees per tick
+export const BASE_RADIUS = 60;
 export const RESPAWN_TICKS = 3 * TICK_RATE;
-export const BASE_RADIUS = 1; // база 3x3 вокруг центра
+export const HEAD_HIT = 20; // heads closer than this collide
+const SELF_GRACE_TICKS = 4; // the freshest trail cells under the head never kill it
 
-export const DIRS = {
-  up: { dx: 0, dy: -1 },
-  down: { dx: 0, dy: 1 },
-  left: { dx: -1, dy: 0 },
-  right: { dx: 1, dy: 0 },
-};
-export const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
-const DIR_CODE = { up: 'U', down: 'D', left: 'L', right: 'R' };
-const CODE_DIR = { U: 'up', D: 'down', L: 'left', R: 'right' };
-
-// Карты: где стоят базы. Вторая база — отражение первой относительно центра,
-// поэтому стороны равны. Препятствий нет: поле открыто, край поля — стена.
-function buildMap(name, cx, cy, dir) {
+// Maps: where the bases are. The second base mirrors the first through the centre.
+function buildMap(name, x, y, heading) {
   return {
     name,
     bases: [
-      { x: cx, y: cy, dir },
-      { x: W - 1 - cx, y: H - 1 - cy, dir: OPPOSITE[dir] },
+      { x, y, heading },
+      { x: WIDTH - x, y: HEIGHT - y, heading: (heading + 180) % 360 },
     ],
   };
 }
 
 export const MAPS = [
-  buildMap('Диагональ', 7, 7, 'right'),
-  buildMap('Фланги', 6, 19, 'right'),
-  buildMap('Ближний бой', 22, 14, 'right'),
+  buildMap('Диагональ', 240, 240, 0),
+  buildMap('Фланги', 200, 500, 0),
+  buildMap('Ближний бой', 560, 380, 0),
 ];
 
-// Раунд i матча: каждая карта играется дважды подряд, стороны меняются каждый раунд.
-// Раунды 1-2 — Диагональ, 3-4 — Фланги, 5-6 — Ближний бой, дальше по кругу.
+// Round i of a match: each map is played twice in a row, sides swap every round.
 export function roundPlan(i) {
   return { mapIndex: Math.floor(i / 2) % MAPS.length, swap: i % 2 === 1 };
 }
 
-export const idx = (x, y) => y * W + x;
-export const inside = (x, y) => x >= 0 && y >= 0 && x < W && y < H;
+export const cellIndex = (x, y) => Math.floor(y / CELL) * COLS + Math.floor(x / CELL);
+export const cellCenter = (i) => ({ x: ((i % COLS) + 0.5) * CELL, y: (Math.floor(i / COLS) + 0.5) * CELL });
+export const insideWorld = (x, y) => x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT;
+const RAD = Math.PI / 180;
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+export function angleDiff(target, from) {
+  let d = (target - from) % 360;
+  if (d > 180) d -= 360;
+  if (d <= -180) d += 360;
+  return d;
+}
+const normHeading = (h) => ((h % 360) + 360) % 360;
 
 // ---------- round ----------
 
@@ -61,35 +72,40 @@ export function createRound({ mapIndex = 0, players = [{}, {}] } = {}) {
     mapIndex: mapIndex % MAPS.length,
     map,
     land: new Int8Array(CELLS).fill(-1),
-    baseOf: new Int8Array(CELLS).fill(-1), // база неприкосновенна: её нельзя захватить
+    baseOf: new Int8Array(CELLS).fill(-1),
     trail: new Int8Array(CELLS).fill(-1),
+    trailTick: new Int32Array(CELLS),
     players: map.bases.map((b, side) => ({
       side,
       name: players[side]?.name || `Игрок ${side + 1}`,
       x: b.x,
       y: b.y,
-      dir: b.dir,
+      heading: b.heading,
       alive: true,
       respawnIn: 0,
-      trail: [],
+      trail: [], // trail points {x, y}: where the head left its land, then one per tick
+      trailCells: [],
       cells: 0,
       tally: emptyTally(),
     })),
-    moves: ['', ''], // применённые ходы по тикам: U D L R, S — стоял (мёртв)
+    moves: [[], []], // applied turn per tick, integer -1000..1000
     over: false,
     winner: null,
   };
+  for (let i = 0; i < CELLS; i++) {
+    const c = cellCenter(i);
+    for (const s of [0, 1]) {
+      const b = map.bases[s];
+      if ((c.x - b.x) ** 2 + (c.y - b.y) ** 2 <= BASE_RADIUS * BASE_RADIUS) round.baseOf[i] = s;
+    }
+  }
   for (const p of round.players) claimBase(round, p);
-  for (let i = 0; i < CELLS; i++) if (round.land[i] >= 0) round.baseOf[i] = round.land[i];
   countCells(round);
   return round;
 }
 
 function claimBase(round, p) {
-  const b = round.map.bases[p.side];
-  for (let dy = -BASE_RADIUS; dy <= BASE_RADIUS; dy++) {
-    for (let dx = -BASE_RADIUS; dx <= BASE_RADIUS; dx++) round.land[idx(b.x + dx, b.y + dy)] = p.side;
-  }
+  for (let i = 0; i < CELLS; i++) if (round.baseOf[i] === p.side) round.land[i] = p.side;
 }
 
 function countCells(round) {
@@ -103,72 +119,75 @@ export function percentOf(round, side) {
   return (100 * round.players[side].cells) / CELLS;
 }
 
-// Любой мусор от бота превращается в направление; разворот на 180° запрещён (считается «прямо»).
-export function sanitizeAction(action, currentDir) {
+// Bot answer -> applied turn as an integer in -1000..1000 (fraction of the max turn per tick).
+// Accepts { turn: -1..1 }, { heading: degrees } or a bare number (= target heading). Junk = 0 (straight).
+export function sanitizeTurn(action, heading) {
   let a = action;
-  if (a && typeof a === 'object') a = a.dir ?? a.direction;
-  if (typeof a === 'string') a = a.trim().toLowerCase();
-  if (a === 'u') a = 'up';
-  else if (a === 'd') a = 'down';
-  else if (a === 'l') a = 'left';
-  else if (a === 'r') a = 'right';
-  if (!DIRS[a] || a === OPPOSITE[currentDir]) return currentDir;
-  return a;
+  if (typeof a === 'number') a = { heading: a };
+  if (!a || typeof a !== 'object') return 0;
+  let v = 0;
+  if (typeof a.heading === 'number' && Number.isFinite(a.heading)) v = angleDiff(a.heading, heading) / TURN_PER_TICK;
+  else if (typeof a.turn === 'number' && Number.isFinite(a.turn)) v = a.turn;
+  return Math.round(clamp(v, -1, 1) * 1000);
 }
-
-export const dirCode = (d) => DIR_CODE[d] || 'S';
-export const codeDir = (c) => CODE_DIR[c] || 'straight';
 
 function playerView(round, p) {
   return {
     x: p.x,
     y: p.y,
-    dir: p.dir,
+    heading: p.heading,
+    speed: SPEED,
+    turnRate: TURN_RATE,
     alive: p.alive,
     respawnIn: p.respawnIn,
-    trail: p.trail.map((i) => ({ x: i % W, y: (i / W) | 0 })),
-    trailLength: p.trail.length,
+    home: p.alive && round.land[cellIndex(p.x, p.y)] === p.side,
+    trail: p.trail.map((q) => ({ x: q.x, y: q.y })),
+    trailCells: p.trailCells.length,
     cells: p.cells,
     percent: percentOf(round, p.side),
-    home: round.land[idx(p.x, p.y)] === p.side,
-    base: { x: round.map.bases[p.side].x, y: round.map.bases[p.side].y },
+    base: { x: round.map.bases[p.side].x, y: round.map.bases[p.side].y, radius: BASE_RADIUS },
     kills: p.tally.kills,
     deaths: p.tally.deaths,
   };
 }
 
-// Что видит бот. Всегда свежий объект: бот не может испортить состояние движка.
-// land / trail — плоские массивы W*H, индекс y*width + x: 0 — пусто, 1 — твоё, 2 — соперника.
+// What a bot sees on its turn. Always a fresh object: bots cannot touch engine state.
+// land / trail: Int8Array(COLS*ROWS), index row*COLS + col: 0 empty, 1 yours, 2 the enemy's.
 export function botView(round, side) {
-  const rel = (v) => (v < 0 ? 0 : v === side ? 1 : 2);
-  const land = new Array(CELLS);
-  const trail = new Array(CELLS);
+  const land = new Int8Array(CELLS);
+  const trail = new Int8Array(CELLS);
+  const other = 1 - side;
   for (let i = 0; i < CELLS; i++) {
-    land[i] = rel(round.land[i]);
-    trail[i] = rel(round.trail[i]);
+    const l = round.land[i];
+    land[i] = l === side ? 1 : l === other ? 2 : 0;
+    const t = round.trail[i];
+    trail[i] = t === side ? 1 : t === other ? 2 : 0;
   }
   return {
     tick: round.tick,
     time: round.tick * DT,
     timeLeft: Math.max(0, ROUND_SECONDS - round.tick * DT),
-    ticksLeft: Math.max(0, ROUND_TICKS - round.tick),
-    tickRate: TICK_RATE,
+    dt: DT,
     side,
-    width: W,
-    height: H,
+    width: WIDTH,
+    height: HEIGHT,
+    cell: CELL,
+    cols: COLS,
+    rows: ROWS,
     mapName: round.map.name,
     land,
     trail,
     me: playerView(round, round.players[side]),
-    enemy: playerView(round, round.players[1 - side]),
+    enemy: playerView(round, round.players[other]),
   };
 }
 
 function kill(round, p, cause, by, events) {
-  const lost = p.cells;
-  const trailLen = p.trail.length;
-  for (const i of p.trail) if (round.trail[i] === p.side) round.trail[i] = -1;
+  const lost = p.cells - countBase(round, p.side);
+  const trailLen = p.trailCells.length;
+  for (const i of p.trailCells) if (round.trail[i] === p.side) round.trail[i] = -1;
   p.trail = [];
+  p.trailCells = [];
   for (let i = 0; i < CELLS; i++) if (round.land[i] === p.side && round.baseOf[i] !== p.side) round.land[i] = -1;
   p.alive = false;
   p.respawnIn = RESPAWN_TICKS;
@@ -179,12 +198,19 @@ function kill(round, p, cause, by, events) {
   events.push({ type: 'death', side: p.side, x: p.x, y: p.y, cause, by, lostCells: lost, trailLength: trailLen });
 }
 
-// Что станет землёй игрока, если его хвост замкнётся: сам хвост и всё, что не достижимо снаружи поля.
+function countBase(round, side) {
+  let n = 0;
+  for (let i = 0; i < CELLS; i++) if (round.baseOf[i] === side) n++;
+  return n;
+}
+
+// What becomes the player's land when the trail closes: the trail itself and everything
+// that cannot be reached from outside the field without crossing the player's land or trail.
 function enclosure(round, side) {
   const p = round.players[side];
   const mine = new Uint8Array(CELLS);
   for (let i = 0; i < CELLS; i++) if (round.land[i] === side) mine[i] = 1;
-  for (const i of p.trail) mine[i] = 1;
+  for (const i of p.trailCells) mine[i] = 1;
   const seen = new Uint8Array(CELLS);
   const stack = [];
   const push = (i) => {
@@ -193,36 +219,68 @@ function enclosure(round, side) {
       stack.push(i);
     }
   };
-  for (let x = 0; x < W; x++) {
-    push(idx(x, 0));
-    push(idx(x, H - 1));
+  for (let x = 0; x < COLS; x++) {
+    push(x);
+    push((ROWS - 1) * COLS + x);
   }
-  for (let y = 0; y < H; y++) {
-    push(idx(0, y));
-    push(idx(W - 1, y));
+  for (let y = 0; y < ROWS; y++) {
+    push(y * COLS);
+    push(y * COLS + COLS - 1);
   }
   while (stack.length) {
     const i = stack.pop();
-    const x = i % W;
-    const y = (i / W) | 0;
+    const x = i % COLS;
     if (x > 0) push(i - 1);
-    if (x < W - 1) push(i + 1);
-    if (y > 0) push(i - W);
-    if (y < H - 1) push(i + W);
+    if (x < COLS - 1) push(i + 1);
+    if (i >= COLS) push(i - COLS);
+    if (i < CELLS - COLS) push(i + COLS);
   }
   const gained = [];
   for (let i = 0; i < CELLS; i++) if (!seen[i] && round.land[i] !== side && round.baseOf[i] !== 1 - side) gained.push(i);
   return gained;
 }
 
-// Один ход. actions[side] — 'up' | 'down' | 'left' | 'right' | 'straight' (или что угодно: мусор = прямо).
+// Cells crossed by the segment (x0,y0)->(x1,y1), in order, without the start cell.
+// A diagonal jump gets the in-between cell too, so a trail is always edge-connected
+// and nothing can slip through it.
+function sweep(x0, y0, x1, y1) {
+  const out = [];
+  let cx = Math.floor(x0 / CELL);
+  let cy = Math.floor(y0 / CELL);
+  const n = 4;
+  for (let k = 1; k <= n; k++) {
+    const x = x0 + ((x1 - x0) * k) / n;
+    const y = y0 + ((y1 - y0) * k) / n;
+    const nx = Math.floor(x / CELL);
+    const ny = Math.floor(y / CELL);
+    if (nx === cx && ny === cy) continue;
+    if (nx !== cx && ny !== cy) out.push({ x: nx, y: cy });
+    out.push({ x: nx, y: ny });
+    cx = nx;
+    cy = ny;
+  }
+  return out.filter((c) => c.x >= 0 && c.y >= 0 && c.x < COLS && c.y < ROWS).map((c) => c.y * COLS + c.x);
+}
+
+// Closest approach of two points moving linearly during one tick.
+function closest(a0, a1, b0, b1) {
+  const rx = b0.x - a0.x;
+  const ry = b0.y - a0.y;
+  const vx = b1.x - b0.x - (a1.x - a0.x);
+  const vy = b1.y - b0.y - (a1.y - a0.y);
+  const vv = vx * vx + vy * vy;
+  const t = vv > 1e-9 ? clamp(-(rx * vx + ry * vy) / vv, 0, 1) : 0;
+  return { d: Math.hypot(rx + vx * t, ry + vy * t), t };
+}
+
+// Advance one tick. actions[side]: { turn } | { heading } | number (see sanitizeTurn).
 export function stepRound(round, actions) {
   if (round.over) return [];
   const events = [];
   const P = round.players;
 
-  // 1. Возрождение. В ход возрождения игрок стоит на базе.
-  for (const p of P) p.respawnedThisTick = false;
+  // 1. Respawn. On its respawn tick a player stands still on its base.
+  const fresh = [false, false];
   for (const p of P) {
     if (p.alive) continue;
     p.tally.ticksDead++;
@@ -231,81 +289,96 @@ export function stepRound(round, actions) {
     p.alive = true;
     p.x = b.x;
     p.y = b.y;
-    p.dir = b.dir;
-    p.respawnedThisTick = true;
+    p.heading = b.heading;
+    fresh[p.side] = true;
     claimBase(round, p);
     events.push({ type: 'respawn', side: p.side, x: p.x, y: p.y });
   }
 
-  // 2. Новые клетки. Выход за край поля — гибель.
+  // 2. Turn and move.
   const moving = [];
   for (const p of P) {
-    if (!p.alive || p.respawnedThisTick) continue;
-    p.dir = sanitizeAction(actions?.[p.side], p.dir);
-    const d = DIRS[p.dir];
-    const nx = p.x + d.dx;
-    const ny = p.y + d.dy;
-    moving.push({ p, nx, ny, from: idx(p.x, p.y) });
+    let q = 0;
+    if (p.alive && !fresh[p.side]) {
+      q = sanitizeTurn(actions?.[p.side], p.heading);
+      p.heading = normHeading(p.heading + (q / 1000) * TURN_PER_TICK);
+      const nx = p.x + Math.cos(p.heading * RAD) * STEP;
+      const ny = p.y + Math.sin(p.heading * RAD) * STEP;
+      moving.push({ p, from: { x: p.x, y: p.y }, to: { x: nx, y: ny }, cells: sweep(p.x, p.y, nx, ny) });
+    }
+    round.moves[p.side].push(q);
   }
-  for (const p of P) round.moves[p.side] += moving.some((m) => m.p === p) ? dirCode(p.dir) : 'S';
   const dead = new Map(); // side -> { cause, by }
-  for (const m of moving) {
-    if (!inside(m.nx, m.ny)) dead.set(m.p.side, { cause: 'wall', by: null });
-  }
-  const live = moving.filter((m) => !dead.has(m.p.side));
+  for (const m of moving) if (!insideWorld(m.to.x, m.to.y)) dead.set(m.p.side, { cause: 'wall', by: null });
 
-  // 3. Столкновение голов (одна клетка или обмен клетками): выживает тот, кто въезжает на свою землю.
-  if (live.length === 2) {
-    const [a, b] = live;
-    const ia = idx(a.nx, a.ny);
-    const ib = idx(b.nx, b.ny);
-    const same = ia === ib;
-    const swap = ia === b.from && ib === a.from;
-    if (same || swap) {
-      for (const m of live) {
-        const i = idx(m.nx, m.ny);
-        if (round.land[i] !== m.p.side) dead.set(m.p.side, { cause: 'head', by: 1 - m.p.side });
+  // 3. Heads meet: whoever is on its own land survives; elsewhere both die.
+  if (moving.length === 2) {
+    const [a, b] = moving;
+    const c = closest(a.from, a.to, b.from, b.to);
+    if (c.d < HEAD_HIT) {
+      for (const m of moving) {
+        if (dead.has(m.p.side)) continue;
+        const home = insideWorld(m.to.x, m.to.y) && round.land[cellIndex(m.to.x, m.to.y)] === m.p.side;
+        if (!home) dead.set(m.p.side, { cause: 'head', by: 1 - m.p.side });
       }
-      events.push({ type: 'headon', x: b.nx, y: b.ny });
+      events.push({ type: 'headon', x: (a.to.x + b.to.x) / 2, y: (a.to.y + b.to.y) / 2 });
     }
   }
 
-  // 4. Хвосты: наехал на чужой — хозяин хвоста погибает, на свой — погибаешь сам.
-  for (const m of live) {
-    if (dead.has(m.p.side) && dead.get(m.p.side).cause === 'head') continue;
-    const t = round.trail[idx(m.nx, m.ny)];
-    if (t === m.p.side) dead.set(m.p.side, { cause: 'self', by: null });
-    else if (t >= 0 && !dead.has(t)) {
-      dead.set(t, { cause: 'cut', by: m.p.side, x: m.nx, y: m.ny });
-    }
-  }
-
-  // Двигаем всех, кто ещё жив в этом ходе, затем применяем гибели.
+  // 4. Trails: crossing the enemy's trail kills its owner; crossing your own kills you.
   for (const m of moving) {
-    if (dead.has(m.p.side) && dead.get(m.p.side).cause === 'wall') continue;
-    m.p.x = m.nx;
-    m.p.y = m.ny;
+    const side = m.p.side;
+    if (dead.has(side) && dead.get(side).cause !== 'cut') continue;
+    for (const i of m.cells) {
+      const t = round.trail[i];
+      if (t === side && round.tick - round.trailTick[i] > SELF_GRACE_TICKS) {
+        dead.set(side, { cause: 'self', by: null });
+        break;
+      }
+      if (t === 1 - side && !dead.has(t)) {
+        const c = cellCenter(i);
+        dead.set(t, { cause: 'cut', by: side, x: c.x, y: c.y });
+      }
+    }
+  }
+
+  for (const m of moving) {
+    if (dead.has(m.p.side) && dead.get(m.p.side).cause === 'wall') {
+      m.p.x = clamp(m.to.x, 0, WIDTH - 0.001);
+      m.p.y = clamp(m.to.y, 0, HEIGHT - 0.001);
+    } else {
+      m.p.x = m.to.x;
+      m.p.y = m.to.y;
+    }
   }
   for (const [side, d] of [...dead.entries()].sort((a, b) => a[0] - b[0])) {
     kill(round, P[side], d.cause, d.by, events);
     if (d.cause === 'cut') events[events.length - 1].cutAt = { x: d.x, y: d.y };
   }
 
-  // 5. Хвост и захват.
+  // 5. Lay trails, detect closing loops.
   const closing = [];
   for (const m of moving) {
     const p = m.p;
     if (!p.alive) continue;
-    const i = idx(p.x, p.y);
-    if (round.land[i] === p.side) {
-      if (p.trail.length) closing.push(p);
-    } else {
-      round.trail[i] = p.side;
-      p.trail.push(i);
-      p.tally.maxTrail = Math.max(p.tally.maxTrail, p.trail.length);
+    for (const i of m.cells) {
+      if (round.land[i] === p.side) continue;
+      if (!p.trailCells.length) p.trail.push({ x: m.from.x, y: m.from.y });
+      if (round.trail[i] !== p.side) {
+        round.trail[i] = p.side;
+        round.trailTick[i] = round.tick;
+        p.trailCells.push(i);
+      }
+    }
+    const home = round.land[cellIndex(p.x, p.y)] === p.side;
+    if (p.trailCells.length) {
+      p.trail.push({ x: p.x, y: p.y });
+      p.tally.maxTrail = Math.max(p.tally.maxTrail, p.trailCells.length);
+      if (home) closing.push(p);
     }
   }
-  // Захваты одновременные: клетка, на которую претендуют оба, остаётся прежнему хозяину.
+
+  // 6. Captures happen together: a cell claimed by both stays with its previous owner.
   const gains = closing.map((p) => ({ p, cells: enclosure(round, p.side) }));
   const claim = new Int8Array(CELLS).fill(-1);
   for (const g of gains) for (const i of g.cells) claim[i] = claim[i] === -1 ? g.p.side : 9;
@@ -321,29 +394,25 @@ export function stepRound(round, actions) {
       if (round.land[i] === 1 - p.side) stolen++;
       round.land[i] = p.side;
       taken++;
-      sx += i % W;
-      sy += (i / W) | 0;
+      sx += (i % COLS) + 0.5;
+      sy += Math.floor(i / COLS) + 0.5;
       cells.push(i);
     }
-    for (const i of p.trail) if (round.trail[i] === p.side) round.trail[i] = -1;
-    const trailLength = p.trail.length;
+    for (const i of p.trailCells) if (round.trail[i] === p.side) round.trail[i] = -1;
+    const trailLength = p.trailCells.length;
     p.trail = [];
+    p.trailCells = [];
     p.tally.captures++;
     p.tally.captured += taken;
     p.tally.biggestCapture = Math.max(p.tally.biggestCapture, taken);
     events.push({
       type: 'capture', side: p.side, cells, count: taken, stolen, trailLength,
-      x: taken ? sx / taken : p.x, y: taken ? sy / taken : p.y,
+      x: taken ? (sx / taken) * CELL : p.x, y: taken ? (sy / taken) * CELL : p.y,
     });
   }
 
   countCells(round);
-  // Потерял всю землю (её целиком обвели) — гибель.
-  for (const p of P) {
-    if (p.alive && p.cells === 0) kill(round, p, 'land', 1 - p.side, events);
-  }
-  if (events.some((e) => e.type === 'death')) countCells(round);
-  for (const p of P) if (p.alive && p.trail.length) p.tally.ticksOut++;
+  for (const p of P) if (p.alive && p.trailCells.length) p.tally.ticksOut++;
 
   round.tick++;
   if (round.tick >= ROUND_TICKS) {
@@ -356,15 +425,15 @@ export function stepRound(round, actions) {
 }
 
 // ---------- replay ----------
-// Реплей хранит применённые ходы обеих сторон: движок детерминирован,
-// поэтому по ним раунд восстанавливается клетка в клетку.
+// A replay keeps the applied turns of both sides. The engine is deterministic,
+// so they rebuild the round exactly.
 
 export function replayRound(replay, onStep) {
   const round = createRound({ mapIndex: replay.mapIndex, players: replay.players });
-  const moves = replay.moves || ['', ''];
+  const moves = replay.moves || [[], []];
   while (!round.over) {
     const t = round.tick;
-    const actions = [0, 1].map((s) => codeDir(moves[s][t]));
+    const actions = [0, 1].map((s) => ({ turn: (moves[s][t] || 0) / 1000 }));
     const events = stepRound(round, actions);
     onStep?.(round, events);
   }

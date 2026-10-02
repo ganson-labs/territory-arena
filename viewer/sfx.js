@@ -1,5 +1,5 @@
 // Synthesised sound effects (WebAudio), no audio files.
-import { W } from '/kit/arena/engine.js';
+import { WIDTH as W } from '/kit/arena/engine.js';
 
 export class Sfx {
   constructor() {
@@ -130,7 +130,7 @@ export class Sfx {
   // Engine events -> sounds.
   events(events) {
     for (const e of events) {
-      if (e.type === 'capture' && e.count > 0) this.play('capture', e.x, e.count);
+      if (e.type === 'capture' && e.count > 0) this.play('capture', e.x, e.count / 10);
       else if (e.type === 'death') this.play(e.cause === 'cut' || e.cause === 'head' ? 'cut' : 'death', e.x);
       else if (e.type === 'respawn') this.play('respawn', e.x);
     }

@@ -31,8 +31,16 @@ self.onmessage = async ({ data: m }) => {
     } catch (err) {
       self.postMessage({ type: 'error', where: 'tick', error: describe(err) });
     }
-    if (action && typeof action === 'object') action = action.dir ?? action.direction ?? null;
     const ms = performance.now() - t0;
-    self.postMessage({ id: m.id, type: 'action', ms, action: typeof action === 'string' ? action.slice(0, 16) : null });
+    // Only plain numbers leave the worker: { turn } or { heading }, a bare number is a target heading.
+    let safe = null;
+    if (typeof action === 'number' && Number.isFinite(action)) safe = { heading: action };
+    else if (action && typeof action === 'object') {
+      const turn = Number(action.turn);
+      const heading = Number(action.heading);
+      if (Number.isFinite(heading)) safe = { heading };
+      else if (Number.isFinite(turn)) safe = { turn };
+    }
+    self.postMessage({ id: m.id, type: 'action', ms, action: safe });
   }
 };

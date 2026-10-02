@@ -1,31 +1,38 @@
 // Стартовый шаблон облика. Замени всё: API — в ARENA.md, раздел «Облик».
-// Каждая функция рисует на переданном ctx (OffscreenCanvas 2D). Цвета из team.json приходят в color и accent.
+// draw вызывается каждый кадр; f.mode — 'arena', 'intro' или 'victory'.
 
 export default {
-  head(ctx, { size, dir, frame, frames, color, accent }) {
-    ctx.fillStyle = color;
+  draw(ctx, f) {
+    if (f.mode !== 'arena') {
+      ctx.fillStyle = f.color;
+      ctx.font = `${Math.round(f.height / 8)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(f.name, f.width / 2, f.height / 2);
+      return;
+    }
     ctx.beginPath();
-    ctx.arc(size / 2, size / 2, size * 0.4, 0, Math.PI * 2);
-    ctx.fill();
-  },
-
-  land(ctx, { size, color, accent }) {
-    ctx.fillStyle = color;
+    for (const ring of f.land) {
+      ctx.moveTo(ring[0], ring[1]);
+      for (let i = 2; i < ring.length; i += 2) ctx.lineTo(ring[i], ring[i + 1]);
+      ctx.closePath();
+    }
+    ctx.fillStyle = f.color;
     ctx.globalAlpha = 0.5;
-    ctx.fillRect(0, 0, size, size);
-  },
-
-  trail(ctx, { size, color, accent }) {
-    ctx.fillStyle = accent;
-    ctx.globalAlpha = 0.7;
-    ctx.fillRect(0, 0, size, size);
-  },
-
-  victory(ctx, { width, height, t, duration, color, accent, name }) {
-    ctx.fillStyle = color;
-    ctx.globalAlpha = Math.min(1, t);
-    ctx.font = `bold ${Math.round(height / 6)}px sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.fillText(name, width / 2, height / 2);
+    ctx.fill('evenodd');
+    ctx.globalAlpha = 1;
+    if (f.trail.length >= 4) {
+      ctx.beginPath();
+      ctx.moveTo(f.trail[0], f.trail[1]);
+      for (let i = 2; i < f.trail.length; i += 2) ctx.lineTo(f.trail[i], f.trail[i + 1]);
+      ctx.strokeStyle = f.accent;
+      ctx.lineWidth = 6 * f.unit;
+      ctx.stroke();
+    }
+    if (f.head.alive) {
+      ctx.fillStyle = f.color;
+      ctx.beginPath();
+      ctx.arc(f.head.x, f.head.y, 14 * f.unit, 0, Math.PI * 2);
+      ctx.fill();
+    }
   },
 };

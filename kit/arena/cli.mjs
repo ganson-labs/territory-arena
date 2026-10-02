@@ -75,7 +75,7 @@ function callBot(entry, fn, arg) {
   }
 }
 
-const CAUSE = { cut: 'срезан', self: 'свой хвост', wall: 'край поля', head: 'лоб в лоб', land: 'обвели всю землю' };
+const CAUSE = { cut: 'срезан', self: 'свой хвост', wall: 'край поля', head: 'лоб в лоб' };
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -113,7 +113,7 @@ async function main() {
         for (const e of events) {
           const who = bySide[e.side]?.name;
           if (e.type === 'death') console.log(`  ${clock(round.tick)}  ${who} погиб: ${CAUSE[e.cause]}, хвост ${e.trailLength}, сгорело ${e.lostCells} клеток`);
-          if (e.type === 'capture' && e.count >= 20) console.log(`  ${clock(round.tick)}  ${who} захватил ${e.count} клеток${e.stolen ? ` (из них у соперника ${e.stolen})` : ''}`);
+          if (e.type === 'capture' && e.count >= 160) console.log(`  ${clock(round.tick)}  ${who} захватил ${e.count} клеток${e.stolen ? ` (из них у соперника ${e.stolen})` : ''}`);
         }
       }
     }

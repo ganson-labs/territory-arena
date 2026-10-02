@@ -1,23 +1,30 @@
-// Canvas renderer: field, territories, heads, effects, HUD and show screens. Logical frame 1920x1080.
-import { W, H, CELLS, ROUND_TICKS, TICK_RATE, MAPS } from '/kit/arena/engine.js';
-import { HEAD_FRAMES, TILE_PX } from './skin-host.js';
+// Canvas renderer: neutral stage, camera, the two team layers drawn by their skins,
+// arena effects, HUD and show screens. Logical frame 1920x1080.
+import { WIDTH, HEIGHT, CELLS, ROUND_TICKS, TICK_RATE, SPEED, BASE_RADIUS } from '/kit/arena/engine.js';
+import { sideRings, cellsRings } from './contours.js';
 
 export const VIEW_W = 1920;
 export const VIEW_H = 1080;
-export const CELL = 23;
-export const FW = W * CELL; // 1472
-export const FH = H * CELL; // 920
+export const FW = 1472;
+export const FH = 920;
 export const OX = (VIEW_W - FW) / 2; // 224
 export const OY = 140;
-const HEAD_SIZE = 64;
-export const VICTORY_BOX = { x: 384, y: 150, w: 1152, h: 648 };
+export const VICTORY_BOX = { x: 384, y: 170, w: 1152, h: 648 };
+const CARD = { w: 840, h: 860, y: 150 };
 const HEAD = '"Russo One", "Arial Black", sans-serif';
 const BODY = '"Inter", "Segoe UI", sans-serif';
+const MAX_LAYER_W = 2560;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const lerp = (a, b, t) => a + (b - a) * t;
 const easeOut = (t) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
-const fmtPct = (v) => (Math.round(v * 10) / 10).toFixed(1);
+export const fmtPct = (v) => (Math.round(v * 10) / 10).toFixed(1);
+const angLerp = (a, b, t) => {
+  let d = (b - a) % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return a + d * t;
+};
 
 function hexToRgb(hex) {
   const h = String(hex || '#ccc').replace('#', '');
@@ -29,9 +36,6 @@ export const rgba = (hex, a) => {
   const [r, g, b] = hexToRgb(hex);
   return `rgba(${r},${g},${b},${a})`;
 };
-
-const cx = (x) => OX + x * CELL + CELL / 2;
-const cy = (y) => OY + y * CELL + CELL / 2;
 const clock = (tick) => {
   const s = Math.ceil(tick / TICK_RATE);
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -45,17 +49,18 @@ export class Renderer {
     this.order = [0, 1];
     this.round = null;
     this.prev = null;
-    this.prevLand = new Int8Array(CELLS).fill(-1);
-    this.flashes = []; // { i, kind: 'gain'|'burn', side, t0 }
-    this.particles = [];
+    this.alpha = 1;
+    this.rings = [[], []];
+    this.events = [[], []]; // per side, waiting for the skin
+    this.fx = []; // arena effects (world coords)
     this.popups = [];
     this.announce = [];
-    this.ghosts = [];
-    this.lastStepAt = 0;
-    this.tickDuration = 1000 / TICK_RATE;
-    this.paths = null;
-    this.patterns = new Map();
-    this.time = 0;
+    this.cam = { x: WIDTH / 2, y: HEIGHT / 2, zoom: 1 };
+    this.camTarget = { x: WIDTH / 2, y: HEIGHT / 2, zoom: 1 };
+    this.slowUntil = 0;
+    this.slowFactor = 1;
+    this.flash = 0;
+    this.show = 0;
     this.resize();
     addEventListener('resize', () => this.resize());
   }
@@ -67,12 +72,14 @@ export class Renderer {
     this.scale = Math.min(this.canvas.width / VIEW_W, this.canvas.height / VIEW_H);
     this.offX = (this.canvas.width - VIEW_W * this.scale) / 2;
     this.offY = (this.canvas.height - VIEW_H * this.scale) / 2;
+    const k = Math.min(1, MAX_LAYER_W / (FW * this.scale));
+    this.layerW = Math.round(FW * this.scale * k);
+    this.layerH = Math.round(FH * this.scale * k);
   }
 
-  // Physical pixel size of the victory box: the skin renders at screen resolution, capped at 1080p.
-  victorySize() {
-    const k = Math.min(1920 / VICTORY_BOX.w, Math.max(0.5, this.scale));
-    return { w: Math.round(VICTORY_BOX.w * k), h: Math.round(VICTORY_BOX.h * k) };
+  boxPx(w, h) {
+    const k = Math.min(1, 1920 / (w * this.scale));
+    return { w: Math.round(w * this.scale * k), h: Math.round(h * this.scale * k) };
   }
 
   // ---------- round state ----------
@@ -82,135 +89,185 @@ export class Renderer {
     this.order = order;
     this.contestants = contestants;
     this.prev = this.snapshot(round);
-    this.prevLand = round.land.slice();
-    this.flashes = [];
-    this.particles = [];
+    this.rings = [sideRings(round.land, 0), sideRings(round.land, 1)];
+    this.events = [[], []];
+    this.fx = [];
     this.popups = [];
     this.announce = [];
-    this.ghosts = [];
-    this.paths = null;
-    this.spawnAt = [performance.now(), performance.now()];
+    this.cam = { x: WIDTH / 2, y: HEIGHT / 2, zoom: 1 };
+    this.camTarget = { ...this.cam };
+    this.slowUntil = 0;
+    this.slowFactor = 1;
   }
 
   snapshot(round) {
-    return round.players.map((p) => ({ x: p.x, y: p.y, alive: p.alive }));
+    return round.players.map((p) => ({ x: p.x, y: p.y, heading: p.heading, alive: p.alive }));
   }
 
   beforeStep(round) {
     this.prev = this.snapshot(round);
-    this.prevLand = round.land.slice();
   }
 
-  sideColor(side) {
+  sideOf(ci) {
+    return this.order.indexOf(ci);
+  }
+
+  colorOfSide(side) {
     return this.contestants[this.order[side]]?.color || '#ccc';
   }
 
   afterStep(round, events) {
-    const now = performance.now();
-    this.lastStepAt = now;
-    this.paths = null;
-    // Land changes -> flashes.
-    for (let i = 0; i < CELLS; i++) {
-      const a = this.prevLand[i];
-      const b = round.land[i];
-      if (a === b) continue;
-      if (b >= 0) this.flashes.push({ i, kind: 'gain', side: b, t0: now });
-      else this.flashes.push({ i, kind: 'burn', side: a, t0: now + Math.random() * 250 });
+    let landChanged = false;
+    for (const e of events) {
+      if (e.type === 'capture' || e.type === 'death' || e.type === 'respawn') landChanged = true;
+      this.onEvent(e, round);
     }
-    for (const e of events) this.onEvent(e, round, now);
+    if (landChanged) this.rings = [sideRings(round.land, 0), sideRings(round.land, 1)];
   }
 
-  onEvent(e, round, now) {
-    const color = this.sideColor(e.side);
-    const c = this.contestants[this.order[e.side]];
-    if (e.type === 'capture' && e.count >= 16) {
+  onEvent(e, round) {
+    const now = this.show;
+    if (e.type === 'capture') {
       const pct = (100 * e.count) / CELLS;
-      this.popups.push({ text: `+${fmtPct(pct)}%`, x: cx(e.x), y: cy(e.y), color, size: clamp(34 + pct * 5, 38, 96), t0: now, life: 1400 });
-      if (pct >= 8) this.shout(`+${fmtPct(pct)}%`, color, `${c.name}: крупный захват`);
-    }
-    if (e.type === 'death') {
-      const x = cx(e.x);
-      const y = cy(e.y);
-      for (let k = 0; k < 46; k++) {
-        const a = Math.random() * Math.PI * 2;
-        const v = 120 + Math.random() * 520;
-        this.particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.6 + Math.random() * 0.7, age: 0, size: 4 + Math.random() * 8, color });
+      const area = e.count ? cellsRings(e.cells) : [];
+      this.events[e.side].push({ type: 'capture', wx: e.x, wy: e.y, percent: pct, cells: e.count, area });
+      if (e.count) this.fx.push({ kind: 'flash', area, t0: now, life: 650, color: this.colorOfSide(e.side) });
+      // Merge with a fresh popup of the same team nearby, so quick small captures read as one number.
+      const near = this.popups.find((q) => q.side === e.side && now - q.t0 < 700 && Math.hypot(q.wx - e.x, q.wy - e.y) < 220);
+      if (near) {
+        near.pct += pct;
+        near.text = `+${fmtPct(near.pct)}%`;
+        near.size = clamp(40 + near.pct * 6, 44, 120);
+        near.t0 = now;
+        near.visible = near.pct >= 1;
+      } else {
+        this.popups.push({ side: e.side, pct, text: `+${fmtPct(pct)}%`, wx: e.x, wy: e.y, color: this.colorOfSide(e.side), size: clamp(40 + pct * 6, 44, 120), t0: now, life: 1500, visible: pct >= 1 });
       }
-      const p = this.prev?.[e.side];
-      this.ghosts.push({ side: e.side, x, y, dir: round.players[e.side].dir, t0: now, ci: this.order[e.side] });
+      if (pct >= 6) this.shout(`+${fmtPct(pct)}%`, this.colorOfSide(e.side), `${this.contestants[this.order[e.side]].name}: крупный захват`);
+    } else if (e.type === 'death') {
+      const victim = this.contestants[this.order[e.side]];
       const killer = e.by != null ? this.contestants[this.order[e.by]] : null;
-      const lost = `−${fmtPct((100 * e.lostCells) / CELLS)}%`;
-      if (e.cause === 'cut') this.shout('ХВОСТ СРЕЗАН!', killer.color, `${killer.name} → ${c.name}: ${lost}`);
-      else if (e.cause === 'self') this.shout('СВОЙ ХВОСТ!', color, `${c.name}: ${lost}`);
-      else if (e.cause === 'wall') this.shout('В КРАЙ ПОЛЯ!', color, `${c.name}: ${lost}`);
-      else if (e.cause === 'head') this.shout('ЛОБ В ЛОБ!', '#ffffff', `${c.name}: ${lost}`);
-      else this.shout('ОКРУЖЁН!', color, `${c.name}: ${lost}`);
-      void p;
+      this.events[e.side].push({ type: 'death', wx: e.x, wy: e.y, cause: e.cause });
+      if (e.by != null) this.events[e.by].push({ type: 'kill', wx: e.x, wy: e.y, cause: e.cause });
+      this.fx.push({ kind: 'shock', wx: e.x, wy: e.y, t0: now, life: 900 });
+      const lostPct = (100 * e.lostCells) / CELLS;
+      const lost = lostPct >= 0.05 ? `сгорело ${fmtPct(lostPct)}%` : 'без потерь';
+      const big = e.cause === 'cut' || e.cause === 'head';
+      // Kill cam: slow motion and a push-in on the spot.
+      this.slowUntil = now + (big ? 1700 : 1000);
+      this.slowFactor = big ? 0.22 : 0.45;
+      this.camTarget = { x: e.x, y: e.y, zoom: big ? 1.9 : 1.35 };
+      this.camRelease = this.slowUntil;
+      this.flash = big ? 0.6 : 0.3;
+      if (e.cause === 'cut') this.shout('ХВОСТ СРЕЗАН!', killer.color, `${killer.name} → ${victim.name}: ${lost}`);
+      else if (e.cause === 'self') this.shout('СВОЙ ХВОСТ!', victim.color, `${victim.name}: ${lost}`);
+      else if (e.cause === 'wall') this.shout('В КРАЙ ПОЛЯ!', victim.color, `${victim.name}: ${lost}`);
+      else this.shout('ЛОБ В ЛОБ!', '#ffffff', `${victim.name}: ${lost}`);
+    } else if (e.type === 'respawn') {
+      this.events[e.side].push({ type: 'respawn', wx: e.x, wy: e.y });
     }
-    if (e.type === 'respawn') this.spawnAt[e.side] = now;
   }
 
   shout(text, color, sub = '') {
-    this.announce.push({ text, color, sub, t0: performance.now() });
+    this.announce.push({ text, color, sub, t0: this.show });
     if (this.announce.length > 2) this.announce.shift();
   }
 
-  update(dt) {
-    for (const p of this.particles) {
-      p.age += dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.vx *= 0.92;
-      p.vy *= 0.92;
-    }
-    this.particles = this.particles.filter((p) => p.age < p.life);
+  // Game-time multiplier for kill cam slow motion.
+  timeScale() {
+    return this.show < this.slowUntil ? this.slowFactor : 1;
   }
 
-  // ---------- patterns & paths ----------
-
-  pattern(c, kind) {
-    const key = `${c.id}:${kind}:${c.artVersion}`;
-    let p = this.patterns.get(key);
-    if (!p) {
-      p = this.ctx.createPattern(c.art[kind], 'repeat');
-      this.patterns.set(key, p);
+  updateCamera(dtShow) {
+    if (this.camRelease && this.show > this.camRelease) {
+      this.camTarget = { x: WIDTH / 2, y: HEIGHT / 2, zoom: 1 };
+      this.camRelease = 0;
     }
-    const k = (4 * CELL) / TILE_PX;
-    p.setTransform(new DOMMatrix().translateSelf(OX, OY).scaleSelf(k, k));
-    return p;
+    const k = 1 - Math.exp(-dtShow / 1000 * (this.camTarget.zoom > this.cam.zoom ? 6 : 3));
+    this.cam.zoom = lerp(this.cam.zoom, this.camTarget.zoom, k);
+    this.cam.x = lerp(this.cam.x, this.camTarget.x, k);
+    this.cam.y = lerp(this.cam.y, this.camTarget.y, k);
+    const hw = WIDTH / (2 * this.cam.zoom);
+    const hh = HEIGHT / (2 * this.cam.zoom);
+    this.cam.x = clamp(this.cam.x, hw, WIDTH - hw);
+    this.cam.y = clamp(this.cam.y, hh, HEIGHT - hh);
+    this.flash = Math.max(0, this.flash - dtShow / 400);
   }
 
-  buildPaths(round) {
-    const fill = [new Path2D(), new Path2D()];
-    const edge = [new Path2D(), new Path2D()];
-    const trail = [new Path2D(), new Path2D()];
-    for (let y = 0; y < H; y++) {
-      let x = 0;
-      while (x < W) {
-        const s = round.land[y * W + x];
-        let x2 = x + 1;
-        while (x2 < W && round.land[y * W + x2] === s) x2++;
-        if (s >= 0) fill[s].rect(OX + x * CELL, OY + y * CELL, (x2 - x) * CELL, CELL);
-        x = x2;
+  // World -> logical screen coordinates.
+  sx(wx) {
+    return OX + FW / 2 + (wx - this.cam.x) * (FW / WIDTH) * this.cam.zoom;
+  }
+  sy(wy) {
+    return OY + FH / 2 + (wy - this.cam.y) * (FH / HEIGHT) * this.cam.zoom;
+  }
+
+  // ---------- skin frames ----------
+
+  headOf(side) {
+    const p = this.round.players[side];
+    const pr = this.prev?.[side];
+    const a = this.alpha;
+    if (!pr || !pr.alive || !p.alive || Math.hypot(pr.x - p.x, pr.y - p.y) > 30) return { x: p.x, y: p.y, heading: p.heading };
+    return { x: lerp(pr.x, p.x, a), y: lerp(pr.y, p.y, a), heading: angLerp(pr.heading, p.heading, a) };
+  }
+
+  arenaFrame(side, dtShow) {
+    const round = this.round;
+    const p = round.players[side];
+    const c = this.contestants[this.order[side]];
+    const W = this.layerW;
+    const H = this.layerH;
+    const unit = (W / WIDTH) * this.cam.zoom;
+    const tx = (x) => (x - this.cam.x) * unit + W / 2;
+    const ty = (y) => (y - this.cam.y) * unit + H / 2;
+    const ring = (r) => {
+      const o = new Float32Array(r.length);
+      for (let i = 0; i < r.length; i += 2) {
+        o[i] = tx(r[i]);
+        o[i + 1] = ty(r[i + 1]);
       }
-    }
-    for (let i = 0; i < CELLS; i++) {
-      const s = round.land[i];
-      if (s < 0) continue;
-      const x = i % W;
-      const y = (i / W) | 0;
-      const X = OX + x * CELL;
-      const Y = OY + y * CELL;
-      const e = edge[s];
-      if (y === 0 || round.land[i - W] !== s) { e.moveTo(X, Y); e.lineTo(X + CELL, Y); }
-      if (y === H - 1 || round.land[i + W] !== s) { e.moveTo(X, Y + CELL); e.lineTo(X + CELL, Y + CELL); }
-      if (x === 0 || round.land[i - 1] !== s) { e.moveTo(X, Y); e.lineTo(X, Y + CELL); }
-      if (x === W - 1 || round.land[i + 1] !== s) { e.moveTo(X + CELL, Y); e.lineTo(X + CELL, Y + CELL); }
-    }
-    for (const p of round.players) {
-      for (const i of p.trail) trail[p.side].rect(OX + (i % W) * CELL + 2, OY + ((i / W) | 0) * CELL + 2, CELL - 4, CELL - 4);
-    }
-    this.paths = { fill, edge, trail };
+      return o;
+    };
+    const head = this.headOf(side);
+    const trailPts = p.trail.length ? [...p.trail, { x: head.x, y: head.y }] : [];
+    const trail = new Float32Array(trailPts.length * 2);
+    trailPts.forEach((q, i) => {
+      trail[2 * i] = tx(q.x);
+      trail[2 * i + 1] = ty(q.y);
+    });
+    const e = this.round.players[1 - side];
+    const eh = this.headOf(1 - side);
+    const base = round.map.bases[side];
+    const events = this.events[side].map((ev) => ({
+      type: ev.type,
+      x: tx(ev.wx),
+      y: ty(ev.wy),
+      ...(ev.type === 'capture' ? { percent: ev.percent, cells: ev.cells, area: ev.area.map(ring) } : {}),
+      ...(ev.cause ? { cause: ev.cause } : {}),
+    }));
+    this.events[side] = [];
+    return {
+      mode: 'arena',
+      t: this.show / 1000,
+      dt: dtShow / 1000,
+      width: W,
+      height: H,
+      unit,
+      color: c.color,
+      accent: c.accent,
+      name: c.name,
+      motto: c.motto,
+      land: this.rings[side].map(ring),
+      base: { x: tx(base.x), y: ty(base.y), r: BASE_RADIUS * unit },
+      trail,
+      head: { x: tx(head.x), y: ty(head.y), heading: head.heading, speed: SPEED * unit, alive: p.alive, respawnIn: p.respawnIn / TICK_RATE, home: p.alive && !p.trail.length },
+      percent: (100 * p.cells) / CELLS,
+      enemyPercent: (100 * e.cells) / CELLS,
+      timeLeft: Math.max(0, ROUND_TICKS - round.tick) / TICK_RATE,
+      enemy: { head: { x: tx(eh.x), y: ty(eh.y), heading: eh.heading, alive: e.alive }, color: this.colorOfSide(1 - side) },
+      events,
+    };
   }
 
   // ---------- drawing ----------
@@ -218,292 +275,251 @@ export class Renderer {
   begin() {
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = '#0a0b0d';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#07080a';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     ctx.setTransform(this.scale, 0, 0, this.scale, this.offX, this.offY);
   }
 
-  drawField(alpha, now) {
+  drawStage() {
     const ctx = this.ctx;
-    const round = this.round;
-    ctx.fillStyle = '#15171b';
-    ctx.fillRect(OX, OY, FW, FH);
-    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
-    ctx.lineWidth = 1;
+    ctx.save();
     ctx.beginPath();
-    for (let x = 1; x < W; x++) { ctx.moveTo(OX + x * CELL, OY); ctx.lineTo(OX + x * CELL, OY + FH); }
-    for (let y = 1; y < H; y++) { ctx.moveTo(OX, OY + y * CELL); ctx.lineTo(OX + FW, OY + y * CELL); }
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(OX - 1, OY - 1, FW + 2, FH + 2);
+    ctx.rect(OX, OY, FW, FH);
+    ctx.clip();
+    const g = ctx.createRadialGradient(VIEW_W / 2, OY + FH / 2, 100, VIEW_W / 2, OY + FH / 2, FW * 0.75);
+    g.addColorStop(0, '#16181d');
+    g.addColorStop(1, '#0c0d10');
+    ctx.fillStyle = g;
+    ctx.fillRect(OX, OY, FW, FH);
+    // World-space dot grid: it moves with the camera, so the push-in reads as motion.
+    const step = 50;
+    const r = 1.3 * this.cam.zoom;
+    ctx.fillStyle = 'rgba(255,255,255,0.07)';
+    for (let wy = step; wy < HEIGHT; wy += step) {
+      const y = this.sy(wy);
+      if (y < OY - 2 || y > OY + FH + 2) continue;
+      for (let wx = step; wx < WIDTH; wx += step) {
+        const x = this.sx(wx);
+        if (x < OX - 2 || x > OX + FW + 2) continue;
+        ctx.fillRect(x - r, y - r, r * 2, r * 2);
+      }
+    }
+    ctx.restore();
+  }
 
-    if (!this.paths) this.buildPaths(round);
-    const { fill, edge, trail } = this.paths;
-    for (let s = 0; s < 2; s++) {
-      const c = this.contestants[this.order[s]];
-      ctx.fillStyle = this.pattern(c, 'land');
-      ctx.fill(fill[s]);
+  drawLayers(dtShow, live) {
+    const ctx = this.ctx;
+    const sides = [0, 1].sort((a, b) => this.round.players[a].trail.length - this.round.players[b].trail.length);
+    for (const side of sides) {
+      const c = this.contestants[this.order[side]];
+      const img = live ? c.skin.frame(this.arenaFrame(side, dtShow)) : c.skin.peek('arena');
+      if (img) ctx.drawImage(img, OX, OY, FW, FH);
     }
-    // Bases: a quiet frame, they can never be taken.
-    for (let s = 0; s < 2; s++) {
-      const b = round.map.bases[s];
-      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-      ctx.setLineDash([6, 5]);
-      ctx.lineWidth = 2;
-      ctx.strokeRect(OX + (b.x - 1) * CELL + 3, OY + (b.y - 1) * CELL + 3, 3 * CELL - 6, 3 * CELL - 6);
-      ctx.setLineDash([]);
-    }
-    for (let s = 0; s < 2; s++) {
-      ctx.strokeStyle = this.sideColor(s);
-      ctx.lineWidth = 3;
-      ctx.lineCap = 'round';
-      ctx.stroke(edge[s]);
-    }
+  }
 
-    // Flashes: captured cells glow white, burnt cells smoulder.
-    const keep = [];
-    for (const f of this.flashes) {
-      const k = (now - f.t0) / (f.kind === 'gain' ? 600 : 900);
-      if (k >= 1) continue;
-      keep.push(f);
-      if (k < 0) continue;
-      const x = OX + (f.i % W) * CELL;
-      const y = OY + ((f.i / W) | 0) * CELL;
-      if (f.kind === 'gain') ctx.fillStyle = `rgba(255,255,255,${0.55 * (1 - k)})`;
-      else ctx.fillStyle = rgba(this.sideColor(f.side), 0.7 * (1 - k));
-      ctx.fillRect(x, y, CELL, CELL);
+  drawArenaFx() {
+    const ctx = this.ctx;
+    const now = this.show;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(OX, OY, FW, FH);
+    ctx.clip();
+    this.fx = this.fx.filter((f) => now - f.t0 < f.life);
+    for (const f of this.fx) {
+      const k = (now - f.t0) / f.life;
+      if (f.kind === 'flash') {
+        ctx.beginPath();
+        for (const r of f.area) {
+          ctx.moveTo(this.sx(r[0]), this.sy(r[1]));
+          for (let i = 2; i < r.length; i += 2) ctx.lineTo(this.sx(r[i]), this.sy(r[i + 1]));
+          ctx.closePath();
+        }
+        ctx.fillStyle = `rgba(255,255,255,${0.55 * (1 - k) * (1 - k)})`;
+        ctx.fill('evenodd');
+        ctx.strokeStyle = `rgba(255,255,255,${0.9 * (1 - k)})`;
+        ctx.lineWidth = 4;
+        ctx.stroke();
+      } else if (f.kind === 'shock') {
+        const x = this.sx(f.wx);
+        const y = this.sy(f.wy);
+        ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - k)})`;
+        ctx.lineWidth = 10 * (1 - k) + 2;
+        ctx.beginPath();
+        ctx.arc(x, y, 20 + easeOut(k) * 260 * this.cam.zoom, 0, Math.PI * 2);
+        ctx.stroke();
+      }
     }
-    this.flashes = keep;
-
-    // Trails.
-    for (let s = 0; s < 2; s++) {
-      const p = round.players[s];
-      if (!p.trail.length) continue;
-      const c = this.contestants[this.order[s]];
-      ctx.save();
-      ctx.shadowColor = 'rgba(0,0,0,0.6)';
-      ctx.shadowBlur = 6;
-      ctx.fillStyle = this.pattern(c, 'trail');
-      ctx.fill(trail[s]);
-      ctx.restore();
-      ctx.strokeStyle = rgba(c.color, 0.9);
-      ctx.lineWidth = 2;
-      ctx.stroke(trail[s]);
-    }
-
-    // Ghosts of the fallen.
-    this.ghosts = this.ghosts.filter((g) => now - g.t0 < 900);
-    for (const g of this.ghosts) {
-      const k = (now - g.t0) / 900;
-      const c = this.contestants[g.ci];
-      const img = c.art.heads[g.dir]?.[0];
-      if (!img) continue;
-      ctx.save();
-      ctx.globalAlpha = 1 - k;
-      ctx.translate(g.x, g.y - k * 40);
-      ctx.rotate(k * 4);
-      const s = HEAD_SIZE * (1 + k * 0.8);
-      ctx.globalAlpha = (1 - k) * 0.8;
-      ctx.drawImage(img, -s / 2, -s / 2, s, s);
-      ctx.restore();
-    }
-
-    // Heads.
-    for (let s = 0; s < 2; s++) {
-      const p = round.players[s];
-      if (!p.alive) continue;
-      const pr = this.prev?.[s];
-      const jump = !pr || !pr.alive || Math.abs(pr.x - p.x) + Math.abs(pr.y - p.y) > 1;
-      const x = jump ? cx(p.x) : lerp(cx(pr.x), cx(p.x), alpha);
-      const y = jump ? cy(p.y) : lerp(cy(pr.y), cy(p.y), alpha);
-      const c = this.contestants[this.order[s]];
-      const pop = easeOut((now - (this.spawnAt?.[s] ?? 0)) / 350);
-      const size = HEAD_SIZE * (0.4 + 0.6 * pop);
-      ctx.save();
-      ctx.fillStyle = 'rgba(0,0,0,0.45)';
-      ctx.beginPath();
-      ctx.ellipse(x + 3, y + 8, size * 0.42, size * 0.3, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = c.color;
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(x, y, size * 0.52, 0, Math.PI * 2);
-      ctx.stroke();
-      const frames = c.art.heads[p.dir] || c.art.heads.right;
-      const img = frames[Math.floor(now / 100) % HEAD_FRAMES];
-      ctx.drawImage(img, x - size / 2, y - size / 2, size, size);
-      ctx.restore();
-    }
-
-    // Particles.
-    for (const p of this.particles) {
-      const k = p.age / p.life;
-      ctx.globalAlpha = 1 - k;
-      ctx.fillStyle = p.color;
-      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
-    }
-    ctx.globalAlpha = 1;
-
-    // Popups.
+    ctx.restore();
+    // "+N%" popups.
     this.popups = this.popups.filter((p) => now - p.t0 < p.life);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (const p of this.popups) {
+      if (!p.visible) continue;
       const k = (now - p.t0) / p.life;
-      ctx.globalAlpha = k < 0.7 ? 1 : 1 - (k - 0.7) / 0.3;
-      ctx.font = `${Math.round(p.size * (0.8 + 0.2 * easeOut(k * 4)))}px ${HEAD}`;
-      ctx.lineWidth = 8;
-      ctx.strokeStyle = 'rgba(0,0,0,0.8)';
-      ctx.strokeText(p.text, p.x, p.y - k * 50);
+      const x = clamp(this.sx(p.wx), OX + 120, OX + FW - 120);
+      const y = clamp(this.sy(p.wy), OY + 60, OY + FH - 60) - easeOut(k) * 70;
+      ctx.save();
+      ctx.globalAlpha = k < 0.75 ? 1 : 1 - (k - 0.75) / 0.25;
+      const s = p.size * (0.6 + 0.4 * easeOut(k * 5));
+      ctx.font = `${Math.round(s)}px ${HEAD}`;
+      ctx.lineWidth = s * 0.16;
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.strokeText(p.text, x, y);
       ctx.fillStyle = '#fff';
       ctx.shadowColor = p.color;
-      ctx.shadowBlur = 20;
-      ctx.fillText(p.text, p.x, p.y - k * 50);
-      ctx.shadowBlur = 0;
+      ctx.shadowBlur = 24;
+      ctx.fillText(p.text, x, y);
+      ctx.restore();
     }
-    ctx.globalAlpha = 1;
     ctx.textBaseline = 'alphabetic';
   }
 
-  drawAnnouncements(now) {
+  drawAnnouncements() {
     const ctx = this.ctx;
-    this.announce = this.announce.filter((a) => now - a.t0 < 2200);
+    const now = this.show;
+    this.announce = this.announce.filter((a) => now - a.t0 < 2300);
     this.announce.forEach((a, n) => {
-      const k = (now - a.t0) / 2200;
-      const y = OY + 150 + n * 140;
+      const k = (now - a.t0) / 2300;
+      const y = OY + 120 + n * 150;
       ctx.save();
       ctx.globalAlpha = k < 0.8 ? 1 : 1 - (k - 0.8) / 0.2;
-      const s = 1 + 0.3 * (1 - easeOut(k * 6));
+      const s = 1 + 0.35 * (1 - easeOut(k * 6));
       ctx.translate(VIEW_W / 2, y);
       ctx.scale(s, s);
       ctx.textAlign = 'center';
-      ctx.font = `64px ${HEAD}`;
-      ctx.lineWidth = 10;
+      ctx.font = `76px ${HEAD}`;
+      ctx.lineWidth = 12;
+      ctx.lineJoin = 'round';
       ctx.strokeStyle = 'rgba(0,0,0,0.85)';
       ctx.strokeText(a.text, 0, 0);
       ctx.fillStyle = '#fff';
       ctx.shadowColor = a.color;
-      ctx.shadowBlur = 30;
+      ctx.shadowBlur = 34;
       ctx.fillText(a.text, 0, 0);
       if (a.sub) {
         ctx.shadowBlur = 0;
-        ctx.font = `600 36px ${BODY}`;
-        ctx.lineWidth = 8;
-        ctx.strokeText(a.sub, 0, 50);
+        ctx.font = `600 38px ${BODY}`;
+        ctx.lineWidth = 9;
+        ctx.strokeText(a.sub, 0, 54);
         ctx.fillStyle = a.color;
-        ctx.fillText(a.sub, 0, 50);
+        ctx.fillText(a.sub, 0, 54);
       }
       ctx.restore();
     });
   }
 
-  percentOf(ci) {
-    const side = this.order.indexOf(ci);
-    return (100 * this.round.players[side].cells) / CELLS;
+  drawLastSeconds(ui) {
+    if (ui.phase !== 'fight') return;
+    const left = (ROUND_TICKS - this.round.tick) / TICK_RATE;
+    if (left > 10 || left <= 0) return;
+    const n = Math.ceil(left);
+    const k = n - left; // 0..1 within the second
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.globalAlpha = 0.32 * (1 - k * 0.7);
+    ctx.font = `${Math.round(460 * (1.15 - 0.15 * easeOut(k * 4)))}px ${HEAD}`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(String(n), VIEW_W / 2, OY + FH / 2 + 20);
+    ctx.restore();
   }
 
-  drawHud(ui, now) {
+  percentOf(ci) {
+    return (100 * this.round.players[this.sideOf(ci)].cells) / CELLS;
+  }
+
+  drawHud(ui) {
     const ctx = this.ctx;
     const round = this.round;
     const [A, B] = this.contestants;
-    // Timer and round label.
     const left = Math.max(0, ROUND_TICKS - round.tick);
     const hurry = left <= 10 * TICK_RATE && ui.phase === 'fight';
     ctx.textAlign = 'center';
     ctx.font = `600 26px ${BODY}`;
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    const label = ui.roundLabel || `РАУНД ${ui.roundIndex + 1}`;
-    ctx.fillText(`${label} · ${round.map.name.toUpperCase()}`, VIEW_W / 2, 32);
+    ctx.fillText(`${ui.roundLabel || `РАУНД ${ui.roundIndex + 1}`} · ${round.map.name.toUpperCase()}`, VIEW_W / 2, 32);
     ctx.save();
     if (hurry) {
-      const pulse = 1 + 0.08 * Math.max(0, Math.sin(now / 80));
-      ctx.translate(VIEW_W / 2, 90);
+      const pulse = 1 + 0.1 * Math.max(0, Math.sin(this.show / 90));
+      ctx.translate(VIEW_W / 2, 88);
       ctx.scale(pulse, pulse);
-      ctx.translate(-VIEW_W / 2, -90);
+      ctx.translate(-VIEW_W / 2, -88);
     }
-    ctx.font = `68px ${HEAD}`;
+    ctx.font = `66px ${HEAD}`;
     ctx.fillStyle = hurry ? '#ff5d5d' : '#ffffff';
-    ctx.fillText(clock(left), VIEW_W / 2, 96);
+    ctx.fillText(clock(left), VIEW_W / 2, 94);
     ctx.restore();
     if (ui.speed !== 1) {
-      ctx.font = `700 28px ${BODY}`;
+      ctx.font = `700 26px ${BODY}`;
       ctx.fillStyle = 'rgba(255,255,255,0.5)';
       ctx.textAlign = 'left';
-      ctx.fillText(`×${ui.speed}`, VIEW_W / 2 + 100, 92);
+      ctx.fillText(`×${ui.speed}`, VIEW_W / 2 + 110, 90);
       ctx.textAlign = 'center';
     }
-    // Round wins next to the timer.
-    if (ui.score) {
-      ctx.font = `64px ${HEAD}`;
-      ctx.fillStyle = A.color;
-      ctx.fillText(String(ui.score[0]), VIEW_W / 2 - 220, 96);
-      ctx.fillStyle = B.color;
-      ctx.fillText(String(ui.score[1]), VIEW_W / 2 + 220, 96);
-    }
-    // Tug-of-war bar.
+    ctx.font = `64px ${HEAD}`;
+    ctx.fillStyle = A.color;
+    ctx.fillText(String(ui.score[0]), VIEW_W / 2 - 230, 94);
+    ctx.fillStyle = B.color;
+    ctx.fillText(String(ui.score[1]), VIEW_W / 2 + 230, 94);
+    // Territory bar.
     const pa = this.percentOf(0);
     const pb = this.percentOf(1);
-    const bx = OX;
-    const bw = FW;
     const by = 112;
     const bh = 16;
     ctx.fillStyle = 'rgba(255,255,255,0.08)';
-    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillRect(OX, by, FW, bh);
     ctx.fillStyle = A.color;
-    ctx.fillRect(bx, by, (bw * pa) / 100, bh);
+    ctx.fillRect(OX, by, (FW * pa) / 100, bh);
     ctx.fillStyle = B.color;
-    ctx.fillRect(bx + bw - (bw * pb) / 100, by, (bw * pb) / 100, bh);
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillRect(bx + bw / 2 - 1, by - 4, 2, bh + 8);
-    // Side panels.
-    this.drawPanel(A, 0, pa, now);
-    this.drawPanel(B, 1, pb, now);
+    ctx.fillRect(OX + FW - (FW * pb) / 100, by, (FW * pb) / 100, bh);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillRect(OX + FW / 2 - 1.5, by - 5, 3, bh + 10);
+    this.drawPanel(A, 0, pa, pb);
+    this.drawPanel(B, 1, pb, pa);
   }
 
-  drawPanel(c, ci, pct, now) {
+  drawPanel(c, ci, pct, other) {
     const ctx = this.ctx;
     const x = ci === 0 ? OX / 2 : VIEW_W - OX / 2;
-    const side = this.order.indexOf(ci);
-    const p = this.round.players[side];
+    const p = this.round.players[this.sideOf(ci)];
+    const x0 = ci === 0 ? 12 : VIEW_W - OX + 12;
     ctx.save();
     const g = ctx.createLinearGradient(0, OY, 0, OY + FH);
-    g.addColorStop(0, rgba(c.color, 0.22));
+    g.addColorStop(0, rgba(c.color, 0.28));
     g.addColorStop(1, rgba(c.color, 0.02));
     ctx.fillStyle = g;
-    ctx.fillRect(ci === 0 ? 12 : VIEW_W - OX + 12, OY, OX - 24, FH);
-    ctx.textAlign = 'center';
-    ctx.font = `700 24px ${BODY}`;
+    ctx.fillRect(x0, OY, OX - 24, FH);
     ctx.fillStyle = c.color;
-    this.fitText(c.model.toUpperCase(), x, OY + 40, OX - 36, 24, `700 {}px ${BODY}`);
-    const img = c.art.portrait[Math.floor(now / 110) % HEAD_FRAMES];
-    if (!p.alive) ctx.globalAlpha = 0.3;
-    ctx.drawImage(img, x - 90, OY + 60, 180, 180);
-    ctx.globalAlpha = 1;
-    if (!p.alive) {
-      ctx.font = `64px ${HEAD}`;
-      ctx.fillStyle = '#fff';
-      ctx.fillText(String(Math.ceil(p.respawnIn / TICK_RATE)), x, OY + 172);
-    }
+    ctx.fillRect(x0, OY, OX - 24, 8);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = c.color;
+    this.fitText(c.model.toUpperCase(), x, OY + 52, OX - 40, 26, `700 {}px ${BODY}`);
     ctx.fillStyle = '#fff';
-    this.wrapName(c.name.toUpperCase(), x, OY + 290, OX - 30);
-    ctx.font = `76px ${HEAD}`;
+    this.wrapName(c.name.toUpperCase(), x, OY + 140, OX - 34);
+    const lead = pct > other;
+    ctx.font = `${lead ? 92 : 80}px ${HEAD}`;
     ctx.fillStyle = '#fff';
     ctx.shadowColor = c.color;
-    ctx.shadowBlur = 24;
-    ctx.fillText(fmtPct(pct), x, OY + 470);
+    ctx.shadowBlur = lead ? 36 : 18;
+    this.fitText(fmtPct(pct), x, OY + 360, OX - 30, lead ? 92 : 80, `{}px ${HEAD}`);
     ctx.shadowBlur = 0;
-    ctx.font = `36px ${HEAD}`;
+    ctx.font = `34px ${HEAD}`;
     ctx.fillStyle = c.color;
-    ctx.fillText('% ПОЛЯ', x, OY + 515);
-    ctx.font = `600 28px ${BODY}`;
-    ctx.fillStyle = 'rgba(255,255,255,0.75)';
-    ctx.fillText(`срезал  ${p.tally.kills}`, x, OY + 610);
-    ctx.fillText(`погиб  ${p.tally.deaths}`, x, OY + 655);
-    if (p.trail.length) {
-      ctx.fillStyle = c.color;
-      ctx.fillText(`хвост  ${p.trail.length}`, x, OY + 700);
+    ctx.fillText('% ПОЛЯ', x, OY + 410);
+    if (!p.alive) {
+      ctx.fillStyle = '#fff';
+      this.fitText('ВОЗРОЖДЕНИЕ', x, OY + 500, OX - 40, 28, `{}px ${HEAD}`);
+      ctx.font = `72px ${HEAD}`;
+      ctx.fillText(String(Math.ceil(p.respawnIn / TICK_RATE)), x, OY + 575);
     }
+    ctx.font = `600 30px ${BODY}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText(`срезал  ${p.tally.kills}`, x, OY + 700);
+    ctx.fillText(`погиб  ${p.tally.deaths}`, x, OY + 748);
     ctx.restore();
   }
 
@@ -520,9 +536,8 @@ export class Renderer {
 
   wrapName(text, x, y, maxW) {
     const ctx = this.ctx;
-    let size = 36;
     const words = text.split(/\s+/);
-    for (; size >= 20; size -= 2) {
+    for (let size = 40; size >= 20; size -= 2) {
       ctx.font = `${size}px ${HEAD}`;
       const lines = [];
       let cur = '';
@@ -535,7 +550,7 @@ export class Renderer {
         }
       }
       lines.push(cur);
-      if (lines.length <= 2 && lines.every((l) => ctx.measureText(l).width <= maxW)) {
+      if (lines.length <= 3 && lines.every((l) => ctx.measureText(l).width <= maxW)) {
         lines.forEach((l, i) => ctx.fillText(l, x, y + i * (size + 6) - ((lines.length - 1) * (size + 6)) / 2));
         return;
       }
@@ -544,60 +559,63 @@ export class Renderer {
   }
 
   dim(a) {
-    this.ctx.fillStyle = `rgba(5,6,8,${a})`;
+    this.ctx.fillStyle = `rgba(4,5,7,${a})`;
     this.ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   }
 
-  drawCountdown(ui, now) {
+  drawCountdown(ui) {
     const ctx = this.ctx;
-    const t = (now - ui.countdown.start) / 1000;
+    const t = (this.show - ui.countdown.start) / 1000;
     const n = 3 - Math.floor(t);
     if (n <= 0) return;
     const k = t % 1;
     ctx.save();
-    ctx.fillStyle = 'rgba(5,6,8,0.35)';
+    ctx.fillStyle = 'rgba(4,5,7,0.35)';
     ctx.fillRect(OX, OY, FW, FH);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.globalAlpha = 1 - k * 0.6;
-    ctx.font = `${Math.round(300 * (1.3 - 0.3 * easeOut(k * 3)))}px ${HEAD}`;
+    ctx.font = `${Math.round(320 * (1.3 - 0.3 * easeOut(k * 3)))}px ${HEAD}`;
     ctx.fillStyle = '#fff';
     ctx.fillText(String(n), VIEW_W / 2, OY + FH / 2);
     ctx.restore();
   }
 
-  drawVictoryScreen(c, title, line1, line2, now, t0) {
+  // Winner screen: the team's own victory animation in the middle, arena text around it.
+  drawVictoryScreen(c, title, line1, line2, t0) {
     const ctx = this.ctx;
-    const k = easeOut((now - t0) / 500);
+    const t = (this.show - t0) / 1000;
+    const k = easeOut(t / 0.5);
     this.dim(0.92 * k);
     ctx.save();
     ctx.globalAlpha = k;
     const b = VICTORY_BOX;
     if (c) {
-      const g = ctx.createRadialGradient(VIEW_W / 2, b.y + b.h / 2, 50, VIEW_W / 2, b.y + b.h / 2, b.w * 0.7);
+      const g = ctx.createRadialGradient(VIEW_W / 2, b.y + b.h / 2, 50, VIEW_W / 2, b.y + b.h / 2, b.w * 0.75);
       g.addColorStop(0, rgba(c.color, 0.25));
       g.addColorStop(1, rgba(c.color, 0));
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-      c.skin.drawVictory(ctx, b.x, b.y, b.w, b.h);
+      const px = this.boxPx(b.w, b.h);
+      const img = c.skin.frame({ mode: 'victory', t, dt: 1 / 60, width: px.w, height: px.h, color: c.color, accent: c.accent, name: c.name, motto: c.motto, percent: this.percentOf(this.contestants.indexOf(c)), events: [] });
+      if (img) ctx.drawImage(img, b.x, b.y, b.w, b.h);
     }
     ctx.textAlign = 'center';
-    ctx.font = `600 34px ${BODY}`;
+    ctx.font = `600 36px ${BODY}`;
     ctx.fillStyle = c ? c.color : '#fff';
-    ctx.fillText(title, VIEW_W / 2, c ? 120 : 380);
-    ctx.font = `84px ${HEAD}`;
+    ctx.fillText(title, VIEW_W / 2, c ? 130 : 400);
+    ctx.font = `88px ${HEAD}`;
     ctx.fillStyle = '#fff';
     ctx.shadowColor = c ? c.color : '#fff';
     ctx.shadowBlur = 30;
-    this.fitText(line1, VIEW_W / 2, c ? 890 : 520, 1700, 84, `{}px ${HEAD}`);
+    this.fitText(line1, VIEW_W / 2, c ? 912 : 530, 1700, 88, `{}px ${HEAD}`);
     ctx.shadowBlur = 0;
-    ctx.font = `600 48px ${BODY}`;
-    ctx.fillStyle = 'rgba(255,255,255,0.85)';
-    ctx.fillText(line2, VIEW_W / 2, c ? 970 : 610);
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    this.fitText(line2, VIEW_W / 2, c ? 995 : 620, 1700, 50, `600 {}px ${BODY}`);
     ctx.restore();
   }
 
-  drawRoundEnd(ui, now) {
+  drawRoundEnd(ui) {
     const bn = ui.banner;
     const c = bn.winner != null ? this.contestants[bn.winner] : null;
     const [pa, pb] = bn.percent;
@@ -605,118 +623,88 @@ export class Renderer {
       c,
       c ? `ПОБЕДА В РАУНДЕ ${ui.roundIndex + 1}` : `РАУНД ${ui.roundIndex + 1}`,
       c ? c.name.toUpperCase() : 'НИЧЬЯ',
-      `${this.contestants[0].name} ${fmtPct(pa)}%  :  ${fmtPct(pb)}% ${this.contestants[1].name}`,
-      now,
+      `${this.contestants[0].name}  ${fmtPct(pa)}%  :  ${fmtPct(pb)}%  ${this.contestants[1].name}`,
       bn.start,
     );
   }
 
-  drawReview(ui, now) {
-    const ctx = this.ctx;
-    const r = ui.review;
-    const [A, B] = this.contestants;
-    this.dim(0.94);
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.font = `600 34px ${BODY}`;
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText(`ТУРНИР С ДОРАБОТКОЙ · РАУНД ${r.done} ИЗ ${r.total} СЫГРАН`, VIEW_W / 2, 150);
-    ctx.font = `96px ${HEAD}`;
-    ctx.fillStyle = '#fff';
-    ctx.fillText(r.finished ? 'ТУРНИР ОКОНЧЕН' : 'ВРЕМЯ НА ДОРАБОТКУ', VIEW_W / 2, 270);
-    // Score.
-    const yS = 470;
-    for (const [c, ci] of [[A, 0], [B, 1]]) {
-      const x = ci === 0 ? VIEW_W / 2 - 420 : VIEW_W / 2 + 420;
-      ctx.drawImage(c.art.portrait[Math.floor(now / 110) % HEAD_FRAMES], x - 110, yS - 200, 220, 220);
-      ctx.font = `44px ${HEAD}`;
-      ctx.fillStyle = c.color;
-      this.fitText(c.name.toUpperCase(), x, yS + 70, 560, 44, `{}px ${HEAD}`);
-      ctx.font = `600 32px ${BODY}`;
-      ctx.fillStyle = 'rgba(255,255,255,0.7)';
-      ctx.fillText(`в последнем раунде ${fmtPct(r.lastPercent[ci])}%`, x, yS + 120);
-    }
-    ctx.font = `150px ${HEAD}`;
-    ctx.fillStyle = '#fff';
-    ctx.fillText(`${r.score[0]} : ${r.score[1]}`, VIEW_W / 2, yS);
-    ctx.font = `600 32px ${BODY}`;
-    ctx.fillStyle = 'rgba(255,255,255,0.75)';
-    const lines = r.saved.length ? ['Сводки и реплеи записаны:', ...r.saved] : ['Файлы раунда не записаны: это спарринг-боты, у них нет папки участника.'];
-    lines.forEach((l, i) => ctx.fillText(l, VIEW_W / 2, 720 + i * 46));
-    if (r.error) {
-      ctx.fillStyle = '#ff6b7a';
-      ctx.fillText(r.error, VIEW_W / 2, 720 + lines.length * 46);
-    }
-    ctx.font = `600 36px ${BODY}`;
-    ctx.fillStyle = '#ffd36b';
-    if (!r.finished) ctx.fillText(`N или кнопка — раунд ${r.done + 1}, команды загрузятся с диска заново`, VIEW_W / 2, 935);
-    ctx.restore();
-  }
-
-  drawMatchEnd(ui, now) {
+  drawMatchEnd(ui) {
     const m = ui.matchEnd;
     const c = m.winner != null ? this.contestants[m.winner] : null;
     this.drawVictoryScreen(
       c,
-      ui.matchEnd.tournament ? 'ПОБЕДИТЕЛЬ ТУРНИРА' : 'ПОБЕДИТЕЛЬ МАТЧА',
+      m.tournament ? 'ПОБЕДИТЕЛЬ ТУРНИРА' : 'ПОБЕДИТЕЛЬ МАТЧА',
       c ? c.name.toUpperCase() : 'НИЧЬЯ',
-      `${this.contestants[0].name} ${m.score[0]} : ${m.score[1]} ${this.contestants[1].name}`,
-      now,
+      `${this.contestants[0].name}  ${m.score[0]} : ${m.score[1]}  ${this.contestants[1].name}`,
       m.start,
     );
   }
 
-  drawIntro(now, ui) {
+  drawReview(ui) {
     const ctx = this.ctx;
-    const t = (now - ui.introStart) / 1000;
+    const r = ui.review;
     const [A, B] = this.contestants;
-    const slant = 120;
-    const inA = easeOut(t / 0.6);
+    this.dim(0.95);
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = `600 34px ${BODY}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText(`ТУРНИР С ДОРАБОТКОЙ · РАУНД ${r.done} ИЗ ${r.total} СЫГРАН`, VIEW_W / 2, 170);
+    ctx.font = `100px ${HEAD}`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText('ВРЕМЯ НА ДОРАБОТКУ', VIEW_W / 2, 300);
+    const yS = 520;
+    for (const [c, ci] of [[A, 0], [B, 1]]) {
+      const x = ci === 0 ? VIEW_W / 2 - 470 : VIEW_W / 2 + 470;
+      ctx.font = `52px ${HEAD}`;
+      ctx.fillStyle = c.color;
+      this.fitText(c.name.toUpperCase(), x, yS - 40, 640, 52, `{}px ${HEAD}`);
+      ctx.font = `600 34px ${BODY}`;
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.fillText(`в раунде ${fmtPct(r.lastPercent[ci])}% поля`, x, yS + 20);
+    }
+    ctx.font = `160px ${HEAD}`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`${r.score[0]} : ${r.score[1]}`, VIEW_W / 2, yS + 40);
+    ctx.font = `600 32px ${BODY}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    const lines = r.saved.length ? ['Сводки и реплеи записаны:', ...r.saved] : ['Файлы раунда не записаны: у спарринг-ботов нет папки участника.'];
+    lines.forEach((l, i) => ctx.fillText(l, VIEW_W / 2, 700 + i * 46));
+    if (r.error) {
+      ctx.fillStyle = '#ff6b7a';
+      ctx.fillText(r.error, VIEW_W / 2, 700 + lines.length * 46);
+    }
+    ctx.font = `600 36px ${BODY}`;
+    ctx.fillStyle = '#ffd36b';
+    ctx.fillText(`N или кнопка — раунд ${r.done + 1}, команды загрузятся с диска заново`, VIEW_W / 2, 935);
+    ctx.restore();
+  }
+
+  drawIntro(ui) {
+    const ctx = this.ctx;
+    const t = (this.show - ui.introStart) / 1000;
+    const [A, B] = this.contestants;
     for (const [c, i] of [[A, 0], [B, 1]]) {
       const g = i === 0 ? ctx.createLinearGradient(0, 0, VIEW_W / 2, 0) : ctx.createLinearGradient(VIEW_W, 0, VIEW_W / 2, 0);
-      g.addColorStop(0, rgba(c.color, 0.3));
-      g.addColorStop(1, rgba(c.color, 0.04));
+      g.addColorStop(0, rgba(c.color, 0.22));
+      g.addColorStop(1, rgba(c.color, 0.02));
       ctx.fillStyle = g;
-      ctx.beginPath();
-      if (i === 0) {
-        ctx.moveTo(0, 0);
-        ctx.lineTo((VIEW_W / 2 + slant) * inA, 0);
-        ctx.lineTo((VIEW_W / 2 - slant) * inA, VIEW_H);
-        ctx.lineTo(0, VIEW_H);
-      } else {
-        ctx.moveTo(VIEW_W, 0);
-        ctx.lineTo(VIEW_W - (VIEW_W / 2 - slant) * inA, 0);
-        ctx.lineTo(VIEW_W - (VIEW_W / 2 + slant) * inA, VIEW_H);
-        ctx.lineTo(VIEW_W, VIEW_H);
-      }
-      ctx.fill();
+      ctx.fillRect(i === 0 ? 0 : VIEW_W / 2, 0, VIEW_W / 2, VIEW_H);
     }
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(VIEW_W / 2 + slant, 0);
-    ctx.lineTo(VIEW_W / 2 - slant, VIEW_H);
-    ctx.stroke();
     for (const [c, i] of [[A, 0], [B, 1]]) {
-      const k = easeOut((t - 0.3 - i * 0.25) / 0.7);
+      const k = easeOut((t - 0.2 - i * 0.3) / 0.7);
       if (k <= 0) continue;
-      const x = i === 1 ? VIEW_W - 480 : 480;
+      const x = i === 0 ? 60 : VIEW_W - 60 - CARD.w;
       ctx.save();
       ctx.globalAlpha = k;
-      ctx.translate((i === 1 ? 1 : -1) * (1 - k) * 200, 0);
-      const img = c.art.portrait[Math.floor(now / 110) % HEAD_FRAMES];
-      ctx.drawImage(img, x - 230, 90, 460, 460);
+      ctx.translate((i === 1 ? 1 : -1) * (1 - k) * 160, 0);
       ctx.textAlign = 'center';
-      ctx.font = `700 30px ${BODY}`;
+      ctx.font = `700 34px ${BODY}`;
       ctx.fillStyle = c.color;
-      ctx.fillText(c.model.toUpperCase(), x, 620);
-      ctx.fillStyle = '#fff';
-      ctx.shadowColor = c.color;
-      ctx.shadowBlur = 24;
-      this.fitText(c.name.toUpperCase(), x, 712, 760, 80, `{}px ${HEAD}`);
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = 'rgba(255,255,255,0.8)';
-      this.wrapMotto(c.motto ? `«${c.motto}»` : '', x, 790, 720);
+      ctx.fillText(c.model.toUpperCase(), x + CARD.w / 2, 110);
+      const px = this.boxPx(CARD.w, CARD.h);
+      const img = c.skin.frame({ mode: 'intro', t: Math.max(0, t - 0.2 - i * 0.3), dt: 1 / 60, width: px.w, height: px.h, color: c.color, accent: c.accent, name: c.name, motto: c.motto, events: [] });
+      if (img) ctx.drawImage(img, x, CARD.y, CARD.w, CARD.h);
       ctx.restore();
     }
     const kv = easeOut((t - 1.1) / 0.4);
@@ -728,50 +716,19 @@ export class Renderer {
       ctx.fillStyle = '#fff';
       ctx.shadowColor = 'rgba(255,255,255,0.6)';
       ctx.shadowBlur = 30;
-      ctx.fillText('VS', VIEW_W / 2, 400);
+      ctx.fillText('VS', VIEW_W / 2, 600);
       ctx.restore();
     }
     if (t > 2.5) {
       ctx.textAlign = 'center';
       ctx.font = `600 28px ${BODY}`;
-      ctx.fillStyle = `rgba(255,255,255,${0.35 + 0.2 * Math.sin(now / 400)})`;
-      ctx.fillText('ПРОБЕЛ — В БОЙ', VIEW_W / 2, 1030);
+      ctx.fillStyle = `rgba(255,255,255,${0.35 + 0.2 * Math.sin(this.show / 400)})`;
+      ctx.fillText('ПРОБЕЛ — В БОЙ', VIEW_W / 2, 1050);
     }
   }
 
-  wrapMotto(text, x, y, maxW) {
+  drawMenuBackdrop() {
     const ctx = this.ctx;
-    ctx.font = `italic 500 36px ${BODY}`;
-    const words = text.split(/\s+/);
-    const lines = [];
-    let cur = '';
-    for (const w of words) {
-      const t = cur ? `${cur} ${w}` : w;
-      if (ctx.measureText(t).width <= maxW || !cur) cur = t;
-      else {
-        lines.push(cur);
-        cur = w;
-      }
-    }
-    if (cur) lines.push(cur);
-    lines.slice(0, 3).forEach((l, i) => ctx.fillText(l, x, y + i * 46));
-  }
-
-  drawMenuBackdrop(now) {
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.globalAlpha = 0.5;
-    const s = 46;
-    for (let y = 0; y < VIEW_H / s; y++) {
-      for (let x = 0; x < VIEW_W / s; x++) {
-        const v = Math.sin(x * 0.4 + now / 1500) + Math.cos(y * 0.5 - now / 1900);
-        if (v > 1.1) ctx.fillStyle = 'rgba(232,130,90,0.18)';
-        else if (v < -1.1) ctx.fillStyle = 'rgba(79,195,201,0.18)';
-        else continue;
-        ctx.fillRect(x * s + 2, y * s + 2, s - 4, s - 4);
-      }
-    }
-    ctx.restore();
     ctx.textAlign = 'center';
     ctx.font = `120px ${HEAD}`;
     ctx.fillStyle = '#fff';
@@ -780,7 +737,7 @@ export class Renderer {
 
   drawPause() {
     const ctx = this.ctx;
-    ctx.fillStyle = 'rgba(5,6,8,0.45)';
+    ctx.fillStyle = 'rgba(4,5,7,0.45)';
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
     ctx.textAlign = 'center';
     ctx.font = `110px ${HEAD}`;
@@ -794,36 +751,41 @@ export class Renderer {
     ctx.font = '600 20px Consolas, monospace';
     ctx.textAlign = 'left';
     const h = 28 * lines.length + 16;
-    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillStyle = 'rgba(0,0,0,0.82)';
     ctx.fillRect(OX, VIEW_H - h - 20, FW, h);
     ctx.fillStyle = '#ffd36b';
-    lines.forEach((l, i) => ctx.fillText(l.slice(0, 130), OX + 12, VIEW_H - h - 20 + 32 + i * 28));
+    lines.forEach((l, i) => ctx.fillText(l.slice(0, 135), OX + 12, VIEW_H - h - 20 + 32 + i * 28));
     ctx.restore();
   }
 
-  frame(now, dt, ui) {
-    this.update(dt);
+  frame(show, dtShow, ui, alpha) {
+    this.show = show;
+    this.alpha = alpha;
     this.begin();
     if (ui.phase === 'menu' || ui.phase === 'loading') {
-      this.drawMenuBackdrop(now);
+      this.drawMenuBackdrop();
       return;
     }
     if (ui.phase === 'intro') {
-      this.drawIntro(now, ui);
+      this.drawIntro(ui);
       return;
     }
-    if (this.round) {
-      const alpha = ui.phase === 'fight' ? clamp((now - this.lastStepAt) / this.tickDuration, 0, 1) : 1;
-      this.drawField(alpha, now);
-      this.drawHud(ui, now);
-      if (ui.phase === 'countdown') this.drawCountdown(ui, now);
-      if (ui.phase === 'fight' || ui.phase === 'countdown') this.drawAnnouncements(now);
-      if (ui.phase === 'roundEnd' && ui.banner) this.drawRoundEnd(ui, now);
-      if (ui.phase === 'review' && ui.review) this.drawReview(ui, now);
-      if (ui.paused) this.drawPause();
+    if (!this.round) return;
+    this.updateCamera(dtShow);
+    this.drawStage();
+    this.drawLayers(dtShow, ui.phase === 'fight' || ui.phase === 'countdown');
+    this.drawArenaFx();
+    this.drawLastSeconds(ui);
+    if (this.flash > 0) {
+      this.ctx.fillStyle = `rgba(255,255,255,${this.flash * 0.35})`;
+      this.ctx.fillRect(OX, OY, FW, FH);
     }
-    if (ui.phase === 'matchEnd') this.drawMatchEnd(ui, now);
+    this.drawHud(ui);
+    if (ui.phase === 'countdown') this.drawCountdown(ui);
+    if (ui.phase === 'fight' || ui.phase === 'countdown') this.drawAnnouncements();
+    if (ui.phase === 'roundEnd' && ui.banner) this.drawRoundEnd(ui);
+    if (ui.phase === 'review' && ui.review) this.drawReview(ui);
+    if (ui.phase === 'matchEnd') this.drawMatchEnd(ui);
+    if (ui.paused) this.drawPause();
   }
 }
-
-export { MAPS };

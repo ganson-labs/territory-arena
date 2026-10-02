@@ -1,5 +1,5 @@
 // Запись раунда в реплей и короткая сводка для участника. Без DOM и Node API.
-import { W, H, CELLS, TICK_RATE, ROUND_SECONDS, MAPS, percentOf, replayRound } from './engine.js';
+import { WIDTH, HEIGHT, CELL, CELLS, TICK_RATE, ROUND_SECONDS, MAPS, percentOf, replayRound } from './engine.js';
 
 export const REPLAY_FORMAT = 'territory-replay/1';
 
@@ -17,7 +17,7 @@ export function createRecorder(round) {
     step(events_) {
       for (const e of events_) {
         if (e.type === 'death') {
-          events.push({ tick: round.tick, type: 'death', side: e.side, cause: e.cause, by: e.by ?? null, x: e.x, y: e.y, lostCells: e.lostCells, trailLength: e.trailLength });
+          events.push({ tick: round.tick, type: 'death', side: e.side, cause: e.cause, by: e.by ?? null, x: Math.round(e.x), y: Math.round(e.y), lostCells: e.lostCells, trailLength: e.trailLength });
         } else if (e.type === 'capture') {
           events.push({ tick: round.tick, type: 'capture', side: e.side, count: e.count, stolen: e.stolen, trailLength: e.trailLength, x: Math.round(e.x), y: Math.round(e.y) });
         } else if (e.type === 'respawn') {
@@ -32,8 +32,9 @@ export function createRecorder(round) {
         round: meta.round ?? 1,
         mapIndex: round.mapIndex,
         mapName: round.map.name,
-        width: W,
-        height: H,
+        width: WIDTH,
+        height: HEIGHT,
+        cell: CELL,
         tickRate: TICK_RATE,
         players: round.players.map((p, side) => ({ side, name: p.name, ...(meta.players?.[side] || {}) })),
         moves: [...round.moves],
@@ -66,24 +67,23 @@ export function verifyReplay(replay) {
 }
 
 function where(x, y) {
-  const v = y < H / 3 ? 'вверху' : y >= (2 * H) / 3 ? 'внизу' : 'в середине по высоте';
-  const h = x < W / 3 ? 'слева' : x >= (2 * W) / 3 ? 'справа' : 'в центре';
-  return `(${x}, ${y}) — ${v} ${h}`;
+  const v = y < HEIGHT / 3 ? 'вверху' : y >= (2 * HEIGHT) / 3 ? 'внизу' : 'в середине по высоте';
+  const h = x < WIDTH / 3 ? 'слева' : x >= (2 * WIDTH) / 3 ? 'справа' : 'в центре';
+  return `(${Math.round(x)}, ${Math.round(y)}) — ${v} ${h}`;
 }
+const units = (cells) => `~${cells * CELL} ед.`;
 
 const CAUSE = {
-  cut: 'соперник наехал на твой хвост',
+  cut: 'соперник пересёк твой хвост',
   self: 'ты наехал на свой хвост',
   wall: 'ты врезался в край поля',
   head: 'столкновение головами не на твоей земле',
-  land: 'твою землю обвели целиком',
 };
 const CAUSE_ENEMY = {
-  cut: 'ты наехал на его хвост',
+  cut: 'ты пересёк его хвост',
   self: 'он наехал на свой хвост',
   wall: 'он врезался в край поля',
   head: 'столкновение головами не на его земле',
-  land: 'ты обвёл всю его землю',
 };
 
 function sideStats(replay, side) {
@@ -108,7 +108,7 @@ export function summarize(replay, you) {
   L.push(`# Раунд ${replay.round}: ${res}`);
   L.push('');
   L.push(`Ты — «${me.name}», соперник — «${en.name}»${en.model ? ` (${en.model})` : ''}.`);
-  L.push(`Карта «${replay.mapName}», твоя база в (${base.x}, ${base.y}), ты играл стороной ${you} (${you === 0 ? 'первая база' : 'вторая база'}).`);
+  L.push(`Карта «${replay.mapName}», поле ${WIDTH}×${HEIGHT}, твоя база в (${base.x}, ${base.y}), ты играл стороной ${you} (${you === 0 ? 'первая база' : 'вторая база'}).`);
   L.push(`Итог по территории: ты ${r.percent[you]}%, соперник ${r.percent[foe]}% поля.`);
   if (replay.match?.score) L.push(`Счёт матча после раунда: ты ${replay.match.score[you]}, соперник ${replay.match.score[foe]}.`);
   L.push('');
@@ -130,18 +130,18 @@ export function summarize(replay, you) {
   L.push('');
   if (!mine.deaths.length) L.push('Ни разу.');
   for (const d of mine.deaths) {
-    L.push(`- ${clock(d.tick)} — ${CAUSE[d.cause] || d.cause}; голова в ${where(d.x, d.y)}, хвост ${d.trailLength} клеток, сгорело ${pct(d.lostCells)}% поля.`);
+    L.push(`- ${clock(d.tick)} — ${CAUSE[d.cause] || d.cause}; голова в ${where(d.x, d.y)}, хвост ${units(d.trailLength)}, сгорело ${pct(d.lostCells)}% поля.`);
   }
   L.push('');
   L.push('## Гибели соперника');
   L.push('');
   if (!theirs.deaths.length) L.push('Ни разу.');
   for (const d of theirs.deaths) {
-    L.push(`- ${clock(d.tick)} — ${CAUSE_ENEMY[d.cause] || d.cause}; его голова в ${where(d.x, d.y)}, хвост ${d.trailLength} клеток, у него сгорело ${pct(d.lostCells)}% поля.`);
+    L.push(`- ${clock(d.tick)} — ${CAUSE_ENEMY[d.cause] || d.cause}; его голова в ${where(d.x, d.y)}, хвост ${units(d.trailLength)}, у него сгорело ${pct(d.lostCells)}% поля.`);
   }
   const describe = (s, who) => {
     const out = [];
-    out.push(`- Захватов: ${s.caps.length}, всего +${pct(s.t.captured)}% поля, в среднем хвост ${s.avgTrail.toFixed(1)} клеток, самый длинный хвост ${s.t.maxTrail}.`);
+    out.push(`- Захватов: ${s.caps.length}, всего +${pct(s.t.captured)}% поля, в среднем хвост ${units(Math.round(s.avgTrail))}, самый длинный ${units(s.t.maxTrail)}.`);
     if (s.top.length) out.push(`- Крупнейшие: ${s.top.map((e) => `+${pct(e.count)}% на ${clock(e.tick)} у ${where(e.x, e.y)}`).join('; ')}.`);
     if (s.stolen) out.push(`- Отнял у ${who} ${pct(s.stolen)}% поля обводом.`);
     out.push(`- Вне своей земли ${Math.round((100 * s.t.ticksOut) / Math.max(1, replay.result.ticks))}% времени, мёртв ${Math.round((100 * s.t.ticksDead) / Math.max(1, replay.result.ticks))}% времени.`);

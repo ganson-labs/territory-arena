@@ -9,8 +9,10 @@ const $ = (s) => document.querySelector(s);
 const R = new Renderer($('#stage'));
 const sfx = new Sfx();
 const params = new URLSearchParams(location.search);
-const ALT_COLORS = ['#e0b04a', '#7aa8ff'];
-const ROUND_END_MS = 4800;
+const ALT_COLOR = '#e0b04a';
+const TICK_MS = 1000 / E.TICK_RATE;
+// ?slow=0.25 runs the whole show (game, skins, camera) at a quarter of real time: for frame-by-frame recording.
+const SLOW = Math.max(0.05, Math.min(1, Number(params.get('slow')) || 1));
 
 const ui = {
   phase: 'menu',
@@ -29,24 +31,25 @@ const ui = {
   debug: false,
 };
 let bots = [];
-window.__arena = ui; // for inspection from devtools and headless checks
-window.__renderer = R;
 let contestants = null;
 let runToken = 0;
 let nextRound = null;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ---------- show clock ----------
+// Everything on screen runs on one clock: game ticks, skins, camera, timers.
+let show = 0;
+const timers = [];
+let frameWaiters = [];
+const sim = { budget: 0 };
+window.__arena = ui;
+window.__renderer = R;
+window.__show = () => show;
 
-async function wait(ms, token) {
-  let left = ms;
-  while (left > 0) {
-    if (token !== runToken) return false;
-    const t0 = performance.now();
-    await sleep(Math.min(left, 30));
-    if (!ui.paused) left -= performance.now() - t0;
-  }
-  return token === runToken;
+function showWait(ms, token) {
+  const at = show + ms;
+  return new Promise((resolve) => timers.push({ at, resolve: () => resolve(token === runToken) }));
 }
+const nextFrame = () => new Promise((r) => frameWaiters.push(r));
 
 // ---------- menu ----------
 
@@ -97,12 +100,12 @@ async function readTeam(entry) {
   };
 }
 
-// Load (or reload from disk) everything about one contestant: team, skin art and bot.
-async function loadContestant(entry, prev) {
+// Load (or reload from disk) everything about one contestant: team, skin and bot.
+async function loadContestant(entry, altColor) {
   const team = await readTeam(entry);
-  if (prev?.altColor) team.color = prev.altColor;
+  if (altColor) team.color = altColor;
   const skin = new SkinHost(team, entry.hasSkin ? `${entry.dir}skin.js` : null);
-  await skin.prepare();
+  await skin.start();
   const host = new BotHost(entry);
   try {
     await host.load();
@@ -111,20 +114,7 @@ async function loadContestant(entry, prev) {
     skin.dispose();
     throw err;
   }
-  return {
-    id: entry.id,
-    entry,
-    host,
-    skin,
-    art: skin.art,
-    artVersion: Date.now() + Math.random(),
-    name: team.name,
-    motto: team.motto,
-    model: entry.model,
-    color: team.color,
-    accent: team.accent,
-    altColor: prev?.altColor,
-  };
+  return { id: entry.id, entry, host, skin, name: team.name, motto: team.motto, model: entry.model, color: team.color, accent: team.accent, altColor };
 }
 
 function disposeAll() {
@@ -135,13 +125,14 @@ function disposeAll() {
 }
 
 async function loadPair(entries, prev) {
-  const loaded = [];
-  for (let k = 0; k < 2; k++) loaded.push(await loadContestant(entries[k], prev?.[k]));
-  if (loaded[0].color.toLowerCase() === loaded[1].color.toLowerCase()) {
-    loaded[1].altColor = ALT_COLORS[0];
-    loaded[1].color = ALT_COLORS[0];
+  const a = await loadContestant(entries[0], prev?.[0]?.altColor);
+  let b = await loadContestant(entries[1], prev?.[1]?.altColor);
+  if (a.color.toLowerCase() === b.color.toLowerCase() && !b.altColor) {
+    b.skin.dispose();
+    b.host.dispose();
+    b = await loadContestant(entries[1], ALT_COLOR);
   }
-  return loaded;
+  return [a, b];
 }
 
 async function prepare() {
@@ -159,7 +150,6 @@ async function prepare() {
   await document.fonts.load('40px "Russo One"').catch(() => {});
   await document.fonts.load('600 40px "Inter"').catch(() => {});
   $('#menu').hidden = true;
-  return contestants;
 }
 
 async function start(mode) {
@@ -174,7 +164,8 @@ async function start(mode) {
   if (mode === 'intro' || mode === 'tournament') {
     ui.phase = 'intro';
     ui.introNext = mode === 'tournament' ? 'tournament' : 'match';
-    ui.introStart = performance.now();
+    ui.introStart = show;
+    if (params.get('autostart')) showWait(Number(params.get('autostart')) * 1000, token).then((ok) => ok && ui.phase === 'intro' && launchFromIntro());
     return;
   }
   runMatch(token);
@@ -212,6 +203,10 @@ async function saveRound(replay, roundNo) {
   return { saved, error };
 }
 
+function tickBots(round, order) {
+  return Promise.all(order.map((ci, side) => contestants[ci].host.tick(E.botView(round, side))));
+}
+
 // Play one round with the current contestants. Returns null when interrupted.
 async function playRound(token, i, roundNo) {
   ui.roundIndex = i;
@@ -224,44 +219,35 @@ async function playRound(token, i, roundNo) {
   if (token !== runToken) return null;
 
   ui.phase = 'countdown';
-  ui.countdown = { start: performance.now() };
+  ui.countdown = { start: show };
   for (let k = 0; k < 3; k++) {
     sfx.play('beep');
-    if (!(await wait(1000, token))) return null;
+    if (!(await showWait(1000, token))) return null;
   }
   ui.countdown = null;
   ui.phase = 'fight';
+  sim.budget = 0;
   sfx.play('go');
   R.shout('ВПЕРЁД!', '#ffffff');
 
-  let slowUntil = 0;
-  let next = performance.now();
   let lastSecond = -1;
+  let actions = await tickBots(round, order);
   while (!round.over) {
-    if (token !== runToken) return null;
-    while (ui.paused) {
-      await sleep(30);
+    while (sim.budget < TICK_MS) {
+      await nextFrame();
       if (token !== runToken) return null;
-      next = performance.now();
     }
-    const actions = await Promise.all(order.map((ci, side) => contestants[ci].host.tick(E.botView(round, side))));
-    if (token !== runToken) return null;
+    sim.budget -= TICK_MS;
     R.beforeStep(round);
     const events = E.stepRound(round, actions);
     rec.step(events);
     R.afterStep(round, events);
     sfx.events(events);
-    if (events.some((e) => e.type === 'death' && (e.cause === 'cut' || e.cause === 'head'))) slowUntil = performance.now() + 1200;
     const left = Math.ceil((E.ROUND_TICKS - round.tick) / E.TICK_RATE);
     if (left <= 10 && left !== lastSecond && left > 0) sfx.play('tick');
     lastSecond = left;
-    const slow = performance.now() < slowUntil;
-    const dur = (1000 * E.DT) / (ui.speed * (slow ? 0.4 : 1));
-    R.tickDuration = dur;
-    next += dur;
-    const delay = next - performance.now();
-    if (delay < -250) next = performance.now();
-    else if (delay > 0) await sleep(delay);
+    if (!round.over) actions = await tickBots(round, order);
+    if (token !== runToken) return null;
   }
   sfx.play('end');
   const winnerCi = round.winner == null ? null : order[round.winner];
@@ -276,32 +262,18 @@ async function playRound(token, i, roundNo) {
 
 async function showRoundEnd(token, res) {
   ui.phase = 'roundEnd';
-  ui.banner = { winner: res.winnerCi, percent: res.percent, start: performance.now() };
-  if (res.winnerCi != null) {
-    sfx.play('win');
-    const { w, h } = R.victorySize();
-    contestants[res.winnerCi].skin.startVictory(w, h, 4);
-  }
-  const ok = await wait(ROUND_END_MS, token);
-  for (const c of contestants) c.skin.stopVictory();
+  ui.banner = { winner: res.winnerCi, percent: res.percent, start: show };
+  if (res.winnerCi != null) sfx.play('win');
+  const ok = await showWait(5500, token);
   ui.banner = null;
   return ok;
 }
 
 function finishMatch(winner, tournament) {
   ui.phase = 'matchEnd';
-  ui.matchEnd = { winner, score: [...ui.score], start: performance.now(), tournament };
+  ui.matchEnd = { winner, score: [...ui.score], start: show, tournament };
   sfx.play('win');
   for (const c of contestants) c.host.dispose();
-  if (winner != null) {
-    const { w, h } = R.victorySize();
-    const replay = () => {
-      if (ui.phase !== 'matchEnd' || !contestants) return;
-      contestants[winner].skin.startVictory(w, h, 4);
-      setTimeout(replay, 5500);
-    };
-    replay();
-  }
 }
 
 async function freshBots() {
@@ -323,7 +295,6 @@ async function runMatch(token) {
   if (token !== runToken) return;
   ui.score = [0, 0];
   ui.matchEnd = null;
-  ui.roundLabel = '';
   let i = 0;
   while (Math.max(...ui.score) < ui.firstTo) {
     ui.roundLabel = `РАУНД ${i + 1}`;
@@ -339,7 +310,7 @@ async function runMatch(token) {
 }
 
 // Tournament with a pause for improvements: after every round the files are written,
-// the viewer waits for N, then reloads both teams from disk.
+// the viewer waits for N, then reloads both teams (bot, team, skin) from disk.
 async function runTournament(token, n) {
   try {
     await freshBots();
@@ -352,7 +323,6 @@ async function runTournament(token, n) {
   const totals = [0, 0];
   for (let i = 0; i < n; i++) {
     if (i > 0) {
-      ui.phase = 'loading-next';
       try {
         const prev = contestants;
         const fresh = await loadPair(prev.map((c) => c.entry), prev);
@@ -384,7 +354,7 @@ async function runTournament(token, n) {
     if (!(await showRoundEnd(token, res))) return;
     const { saved, error } = await savePromise;
     if (i === n - 1) break;
-    ui.review = { done: i + 1, total: n, score: [...ui.score], lastPercent: res.percent, saved, error, finished: false };
+    ui.review = { done: i + 1, total: n, score: [...ui.score], lastPercent: res.percent, saved, error };
     ui.phase = 'review';
     for (const c of contestants) c.host.dispose();
     $('#btnNext').textContent = `Раунд ${i + 2}`;
@@ -408,19 +378,29 @@ function goNext() {
 
 // ---------- loop & input ----------
 
-let last = performance.now();
-function loop(now) {
-  const dt = Math.max(0, Math.min(0.25, (now - last) / 1000));
-  last = now;
+let lastReal = performance.now();
+function loop(realNow) {
   requestAnimationFrame(loop);
+  const dtReal = Math.max(0, Math.min(100, realNow - lastReal));
+  lastReal = realNow;
+  const dtShow = ui.paused ? 0 : dtReal * SLOW;
+  show += dtShow;
+  for (let k = timers.length - 1; k >= 0; k--) {
+    if (timers[k].at <= show) timers.splice(k, 1)[0].resolve();
+  }
+  if (ui.phase === 'fight') sim.budget = Math.min(sim.budget + dtShow * ui.speed * R.timeScale(), 400);
+  const waiting = frameWaiters;
+  frameWaiters = [];
+  for (const w of waiting) w();
   try {
-    R.frame(now, dt, ui);
+    const alpha = ui.phase === 'fight' ? Math.max(0, Math.min(1, sim.budget / TICK_MS)) : 1;
+    R.frame(show, dtShow, ui, alpha);
     if (ui.debug && contestants) {
       R.drawDebug(contestants.flatMap((c) => {
         const h = c.host?.health() || {};
         return [
-          `${c.name} (${c.id}): ошибок ${h.errors ?? 0}, пропусков ${h.missed ?? 0}${h.frozen ? ', ЗАВИС' : ''}${h.lastError ? ' — ' + h.lastError.slice(0, 80) : ''}`,
-          `   облик: ${Object.entries(c.skin.status).map(([k, v]) => `${k} ${v}`).join(', ') || 'по умолчанию'}${c.skin.errors.length ? ' — ' + c.skin.errors[c.skin.errors.length - 1].slice(0, 70) : ''}`,
+          `${c.name} (${c.id}): ошибок ${h.errors ?? 0}, пропусков ${h.missed ?? 0}${h.frozen ? ', ЗАВИС' : ''}${h.lastError ? ' — ' + h.lastError.slice(0, 70) : ''}`,
+          `   облик: ${c.skin.status()}`,
         ];
       }));
     }
@@ -471,6 +451,7 @@ $('#btnNext').onclick = () => goNext();
 loadBotList()
   .then(() => {
     if (params.get('speed')) ui.speed = Number(params.get('speed')) || 1;
+    if (params.get('debug')) ui.debug = true;
     if (params.get('auto')) start(params.get('auto'));
   })
   .catch((err) => showMenu(`Не удалось получить список ботов: ${err.message}`, true));

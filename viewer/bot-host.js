@@ -3,6 +3,9 @@ export const TICK_TIMEOUT_MS = 50;
 // The 50 ms limit is measured inside the worker, so a busy page (4K rendering)
 // never costs a bot its turn. The page itself waits a little longer for the answer.
 const WAIT_MS = 300;
+// Warm-up: during the first 2 seconds of a round (JIT, first allocations) a move may take up to 250 ms.
+const WARMUP_TICKS = 40;
+const WARMUP_MS = 250;
 // A bot is considered hung only after this much real time without any answer.
 const FREEZE_MS = 3000;
 
@@ -21,6 +24,7 @@ export class BotHost {
     this.frozen = false;
     this.errors = 0;
     this.missed = 0;
+    this.misses = [];
     this.lastError = '';
   }
 
@@ -95,9 +99,11 @@ export class BotHost {
       this.checkFrozen();
       return null;
     }
-    const r = await this.work({ type: 'tick', view }, WAIT_MS);
-    if (r === undefined || r.ms > TICK_TIMEOUT_MS) {
+    const warm = view.tick < WARMUP_TICKS;
+    const r = await this.work({ type: 'tick', view }, warm ? WARMUP_MS + 50 : WAIT_MS);
+    if (r === undefined || r.ms > (warm ? WARMUP_MS : TICK_TIMEOUT_MS)) {
       this.missed++;
+      if (this.misses.length < 20) this.misses.push({ tick: view.tick, ms: r === undefined ? null : Math.round(r.ms) });
       return null;
     }
     return r.action;
@@ -112,7 +118,7 @@ export class BotHost {
   }
 
   health() {
-    return { missed: this.missed, errors: this.errors, frozen: this.frozen, lastError: String(this.lastError || '').split('\n')[0].slice(0, 200) };
+    return { missed: this.missed, misses: this.misses, errors: this.errors, frozen: this.frozen, lastError: String(this.lastError || '').split('\n')[0].slice(0, 200) };
   }
 
   dispose() {
