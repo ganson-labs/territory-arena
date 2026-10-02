@@ -321,11 +321,14 @@ async function runTournament(token, n) {
     showMenu(String(err.message || err), true);
     return;
   }
-  ui.score = [0, 0];
+  // Продолжение турнира после перезагрузки страницы: ?from=2&score=1:0&totals=93.8:1.1
+  const from = Math.max(1, Math.min(n, Number(params.get('from')) || 1));
+  const pair = (k) => (params.get(k) || '0:0').split(':').map((x) => Number(x) || 0);
+  ui.score = from > 1 ? pair('score') : [0, 0];
   ui.matchEnd = null;
-  const totals = [0, 0];
-  for (let i = 0; i < n; i++) {
-    if (i > 0) {
+  const totals = from > 1 ? pair('totals') : [0, 0];
+  for (let i = from - 1; i < n; i++) {
+    if (i > from - 1) {
       try {
         const prev = contestants;
         const fresh = await loadPair(prev.map((c) => c.entry), prev);
@@ -372,6 +375,7 @@ async function runTournament(token, n) {
 }
 
 function goNext() {
+  sfx.unlock();
   if (ui.phase !== 'review' || !nextRound) return;
   const r = nextRound;
   nextRound = null;
@@ -444,6 +448,10 @@ addEventListener('keydown', (e) => {
     else document.documentElement.requestFullscreen();
   }
 });
+
+// Браузер включает звук только после жеста пользователя, а с ?auto= страница стартует сама.
+addEventListener('keydown', () => sfx.unlock());
+addEventListener('pointerdown', () => sfx.unlock());
 
 $('#btnIntro').onclick = () => start('intro');
 $('#btnFight').onclick = () => start('fight');
