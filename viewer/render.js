@@ -14,6 +14,7 @@ const CARD = { w: 840, h: 860, y: 150 };
 const HEAD = '"Russo One", "Arial Black", sans-serif';
 const BODY = '"Inter", "Segoe UI", sans-serif';
 const MAX_LAYER_W = 2560;
+const MAX_BOX_W = 1920;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -61,6 +62,9 @@ export class Renderer {
     this.slowFactor = 1;
     this.flash = 0;
     this.show = 0;
+    // ?layers=native: team layers and skin boxes at the full canvas resolution (4K capture),
+    // otherwise capped to keep the per-frame skin budget on big screens.
+    this.nativeLayers = false;
     this.resize();
     addEventListener('resize', () => this.resize());
   }
@@ -72,13 +76,13 @@ export class Renderer {
     this.scale = Math.min(this.canvas.width / VIEW_W, this.canvas.height / VIEW_H);
     this.offX = (this.canvas.width - VIEW_W * this.scale) / 2;
     this.offY = (this.canvas.height - VIEW_H * this.scale) / 2;
-    const k = Math.min(1, MAX_LAYER_W / (FW * this.scale));
+    const k = this.nativeLayers ? 1 : Math.min(1, MAX_LAYER_W / (FW * this.scale));
     this.layerW = Math.round(FW * this.scale * k);
     this.layerH = Math.round(FH * this.scale * k);
   }
 
   boxPx(w, h) {
-    const k = Math.min(1, 1920 / (w * this.scale));
+    const k = this.nativeLayers ? 1 : Math.min(1, MAX_BOX_W / (w * this.scale));
     return { w: Math.round(w * this.scale * k), h: Math.round(h * this.scale * k) };
   }
 
@@ -719,7 +723,7 @@ export class Renderer {
       ctx.fillText('VS', VIEW_W / 2, 600);
       ctx.restore();
     }
-    if (t > 2.5) {
+    if (t > 2.5 && !ui.noHint) {
       ctx.textAlign = 'center';
       ctx.font = `600 28px ${BODY}`;
       ctx.fillStyle = `rgba(255,255,255,${0.35 + 0.2 * Math.sin(this.show / 400)})`;

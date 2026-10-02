@@ -55,7 +55,12 @@ async function loadImages(assets, errors) {
 }
 
 export class SkinHost {
-  constructor(team, url, assets = []) {
+  // det (capture only): { seed, clock: () => show ms }. The worker then runs on that virtual clock with a
+  // seeded Math.random, and the 8 ms budget is not enforced (frames are not real time); the real drawing
+  // time is still measured and shown in status().
+  constructor(team, url, assets = [], det = null) {
+    this.det = det;
+    this.realMs = { max: 0, sum: 0, n: 0, over: 0 };
     this.team = team; // { name, motto, color, accent }
     this.url = url;
     this.assets = assets; // [{ name, url }]
@@ -98,7 +103,7 @@ export class SkinHost {
     const images = await loadImages(this.assets, this.imageErrors);
     this.imageCount = Object.keys(images).length;
     this.worker.postMessage({ type: 'images', images }, Object.values(images));
-    this.worker.postMessage({ type: 'load', url: `${location.origin}${this.url}?v=${Date.now()}` });
+    this.worker.postMessage({ type: 'load', url: `${location.origin}${this.url}?v=${Date.now()}`, det: this.det ? { seed: this.det.seed, now: this.det.clock() } : null });
     const r = await loaded;
     if (!r || r.error || !r.hasDraw) {
       this.giveUp(!r ? 'skin.js не загрузился за 5 с' : r.error ? `skin.js не загрузился: ${r.error.split('\n')[0]}` : 'в skin.js нет функции draw');
@@ -129,8 +134,16 @@ export class SkinHost {
       return;
     }
     this.busy = false;
+    this.wake?.();
     this.frames++;
     this.maxMs = Math.max(this.maxMs, m.ms);
+    if (m.realMs != null) {
+      const r = this.realMs;
+      r.max = Math.max(r.max, m.realMs);
+      r.sum += m.realMs;
+      r.n++;
+      if (m.realMs > BUDGET_MS) r.over++;
+    }
     this.slow.push(m.ms > BUDGET_MS ? 1 : 0);
     if (this.slow.length > SLOW_WINDOW) this.slow.shift();
     if (m.error) {
@@ -165,8 +178,25 @@ export class SkinHost {
     }
     this.busy = true;
     this.busySince = performance.now();
-    this.worker.postMessage({ type: 'frame', id: this.seq, f: { ...f, events } });
+    this.worker.postMessage({ type: 'frame', id: this.seq, f: { ...f, events }, now: this.det ? this.det.clock() : undefined });
     return this.latest[f.mode] || null;
+  }
+
+  // Capture: resolves when the worker has answered the last frame (or the skin fell back).
+  idle(ms = 20000) {
+    if (!this.busy || this.fallback) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.wake = null;
+        this.giveUp(`завис: нет ответа ${ms / 1000} с (запись)`);
+        resolve(false);
+      }, ms);
+      this.wake = () => {
+        clearTimeout(timer);
+        this.wake = null;
+        resolve(true);
+      };
+    });
   }
 
   // Last image of a mode without asking for a new one (frozen field under the winner screen).
@@ -195,7 +225,9 @@ export class SkinHost {
     const img = this.assets.length ? `, картинок ${this.imageCount}/${this.assets.length}${this.imageErrors.length ? ` (сбой: ${this.imageErrors[0].slice(0, 50)})` : ''}` : '';
     if (this.fallback) return `по умолчанию (${this.reason})${img}`;
     const slow = this.slow.reduce((a, b) => a + b, 0);
-    return `облик команды: кадров ${this.frames}, макс ${this.maxMs.toFixed(1)} мс, медленных ${slow}/${this.slow.length}, ошибок ${this.errors}${img}`;
+    const r = this.realMs;
+    const real = this.det && r.n ? `; реально в среднем ${(r.sum / r.n).toFixed(1)} мс, макс ${r.max.toFixed(1)} мс, дольше ${BUDGET_MS} мс: ${r.over}/${r.n}` : '';
+    return `облик команды: кадров ${this.frames}, макс ${this.maxMs.toFixed(1)} мс, медленных ${slow}/${this.slow.length}, ошибок ${this.errors}${img}${real}`;
   }
 
   dispose() {

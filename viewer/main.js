@@ -1,6 +1,7 @@
 import * as E from '/kit/arena/engine.js';
 import { createRecorder, summarize } from '/kit/arena/report.js';
 import { BotHost } from './bot-host.js';
+import { ReplayHost } from './replay-host.js';
 import { SkinHost } from './skin-host.js';
 import { Renderer } from './render.js';
 import { Sfx } from './sfx.js';
@@ -13,6 +14,18 @@ const ALT_COLOR = '#e0b04a';
 const TICK_MS = 1000 / E.TICK_RATE;
 // ?slow=0.25 runs the whole show (game, skins, camera) at a quarter of real time: for frame-by-frame recording.
 const SLOW = Math.max(0.05, Math.min(1, Number(params.get('slow')) || 1));
+// ?replay=<id участника или путь к его папке>: раунды турнира из rounds/round-N.json вместо ботов
+// (или replay=url:<адрес файла реплея>).
+// &round=2 или 1,3 или 1-3 — какие раунды (по умолчанию все из &rounds=3); после последнего раунда турнира — победитель.
+const REPLAY = params.get('replay');
+// ?capture=1: покадровая запись. Своего rAF-цикла нет, кадр делает window.__cap.step() ровно на 1/60 с шоу,
+// облики получают виртуальное время и засеянный Math.random, звуки пишутся в журнал (window.__cap.sfxLog).
+const CAPTURE = params.has('capture');
+// ?layers=native: слои команд и окна обликов в полном разрешении холста (запись 4K).
+if (params.get('layers') === 'native') {
+  R.nativeLayers = true;
+  R.resize();
+}
 
 const ui = {
   phase: 'menu',
@@ -29,11 +42,14 @@ const ui = {
   introStart: 0,
   introNext: 'match',
   debug: false,
+  noHint: !!REPLAY, // в реплее пробел никто не жмёт: подсказки «ПРОБЕЛ — В БОЙ» нет
 };
 let bots = [];
 let contestants = null;
 let runToken = 0;
 let nextRound = null;
+let loading = 0; // > 0 while teams load from disk: capture does not step frames then
+const sfxLog = [];
 
 // ---------- show clock ----------
 // Everything on screen runs on one clock: game ticks, skins, camera, timers.
@@ -44,6 +60,11 @@ const sim = { budget: 0 };
 window.__arena = ui;
 window.__renderer = R;
 window.__show = () => show;
+if (CAPTURE) {
+  // Sounds are not played but logged with the show time; the capture renders them offline.
+  sfx.unlock = () => {};
+  sfx.play = (name, x, k) => sfxLog.push({ show, name, x: x ?? null, k: k ?? 0 });
+}
 
 function showWait(ms, token) {
   const at = show + ms;
@@ -107,9 +128,10 @@ async function readTeam(entry) {
 async function loadContestant(entry, altColor) {
   const team = await readTeam(entry);
   if (altColor) team.color = altColor;
-  const skin = new SkinHost(team, entry.hasSkin ? `${entry.dir}skin.js` : null, entry.assets || []);
+  const det = CAPTURE ? { seed: hashSeed(`${entry.id}|${team.name}`), clock: () => show } : null;
+  const skin = new SkinHost(team, entry.hasSkin ? `${entry.dir}skin.js` : null, entry.assets || [], det);
   await skin.start();
-  const host = new BotHost(entry);
+  const host = REPLAY ? new ReplayHost(entry) : new BotHost(entry);
   try {
     await host.load();
   } catch (err) {
@@ -127,7 +149,22 @@ function disposeAll() {
   }
 }
 
+function hashSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
 async function loadPair(entries, prev) {
+  loading++;
+  try {
+    return await loadPairNow(entries, prev);
+  } finally {
+    loading--;
+  }
+}
+
+async function loadPairNow(entries, prev) {
   const a = await loadContestant(entries[0], prev?.[0]?.altColor);
   let b = await loadContestant(entries[1], prev?.[1]?.altColor);
   if (a.color.toLowerCase() === b.color.toLowerCase() && !b.altColor) {
@@ -139,6 +176,15 @@ async function loadPair(entries, prev) {
 }
 
 async function prepare() {
+  loading++;
+  try {
+    await prepareNow();
+  } finally {
+    loading--;
+  }
+}
+
+async function prepareNow() {
   sfx.unlock();
   disposeAll();
   ui.phase = 'loading';
@@ -166,17 +212,19 @@ async function start(mode) {
   const token = ++runToken;
   if (mode === 'intro' || mode === 'tournament') {
     ui.phase = 'intro';
-    ui.introNext = mode === 'tournament' ? 'tournament' : 'match';
+    ui.introNext = REPLAY ? 'replay' : mode === 'tournament' ? 'tournament' : 'match';
     ui.introStart = show;
     if (params.get('autostart')) showWait(Number(params.get('autostart')) * 1000, token).then((ok) => ok && ui.phase === 'intro' && launchFromIntro());
     return;
   }
-  runMatch(token);
+  if (REPLAY) runReplay(token);
+  else runMatch(token);
 }
 
 function launchFromIntro() {
   const token = ++runToken;
-  if (ui.introNext === 'tournament') runTournament(token, Math.max(1, Math.min(9, Number($('#tourRounds').value) || 3)));
+  if (ui.introNext === 'replay') runReplay(token);
+  else if (ui.introNext === 'tournament') runTournament(token, Math.max(1, Math.min(9, Number($('#tourRounds').value) || 3)));
   else runMatch(token);
 }
 
@@ -211,11 +259,19 @@ function tickBots(round, order) {
 }
 
 // Play one round with the current contestants. Returns null when interrupted.
-async function playRound(token, i, roundNo) {
+async function playRound(token, i, roundNo, replay = null) {
   ui.roundIndex = i;
   const plan = E.roundPlan(i);
-  const order = plan.swap ? [1, 0] : [0, 1];
-  const round = E.createRound({ mapIndex: plan.mapIndex, players: order.map((ci) => ({ name: contestants[ci].name })) });
+  let order = plan.swap ? [1, 0] : [0, 1];
+  let mapIndex = plan.mapIndex;
+  if (replay) {
+    // Sides and map exactly as recorded; the contestant of each side is found by id.
+    order = replay.players.map((p) => contestants.findIndex((c) => c.id === p.id));
+    if (order.some((ci) => ci < 0) || order[0] === order[1]) throw new Error(`в реплее другие участники: ${replay.players.map((p) => p.id).join(', ')}`);
+    mapIndex = replay.mapIndex;
+    for (const c of contestants) c.host.use(replay);
+  }
+  const round = E.createRound({ mapIndex, players: order.map((ci) => ({ name: contestants[ci].name })) });
   const rec = createRecorder(round);
   R.newRound(round, order, contestants);
   await Promise.all(order.map((ci, side) => contestants[ci].host.init({ round: i, side, mapName: round.map.name, view: E.botView(round, side) })));
@@ -255,12 +311,115 @@ async function playRound(token, i, roundNo) {
   sfx.play('end');
   const winnerCi = round.winner == null ? null : order[round.winner];
   const health = order.map((ci) => contestants[ci].host.health());
-  const replay = rec.finish({
+  const rebuilt = rec.finish({
     round: roundNo,
     health,
     players: order.map((ci) => ({ ci, id: contestants[ci].id, model: contestants[ci].model, name: contestants[ci].name })),
   });
-  return { round, replay, order, winnerCi, percent: [0, 1].map((ci) => E.percentOf(round, order.indexOf(ci))) };
+  return { round, replay: rebuilt, order, winnerCi, percent: [0, 1].map((ci) => E.percentOf(round, order.indexOf(ci))) };
+}
+
+// ---------- replay ----------
+
+function replayUrl(n) {
+  // url:<адрес> — свой файл реплея (например, бой спарринг-ботов из песочницы); {n} заменяется номером раунда.
+  if (REPLAY.startsWith('url:')) return REPLAY.slice(4).replace('{n}', n);
+  if (/^([a-zA-Z]:)?[\\/]/.test(REPLAY)) {
+    const entry = bots.find((b) => b.id === REPLAY);
+    if (!entry) throw new Error(`нет участника с папкой ${REPLAY}`);
+    return `${entry.dir.replace(/bot\/$/, '')}rounds/round-${n}.json`;
+  }
+  return `/team/${encodeURIComponent(REPLAY)}/rounds/round-${n}.json`;
+}
+
+async function fetchReplay(n) {
+  const r = await fetch(`${replayUrl(n)}?v=${Date.now()}`);
+  if (!r.ok) throw new Error(`реплей раунда ${n} не читается: ${r.status}`);
+  return r.json();
+}
+
+function parseRounds(spec, n) {
+  if (!spec) return Array.from({ length: n }, (_, k) => k + 1);
+  const out = [];
+  for (const part of spec.split(',')) {
+    const [a, b] = part.split('-').map(Number);
+    for (let k = a; k <= (b || a); k++) if (k >= 1 && k <= n && !out.includes(k)) out.push(k);
+  }
+  return out.sort((x, y) => x - y);
+}
+
+// Compare the rebuilt round with the recorded one (result, tallies, events, timeline, moves).
+function checkReplay(replay, rebuilt) {
+  const fields = ['mapIndex', 'result', 'tallies', 'events', 'timeline', 'moves'];
+  const diff = fields.filter((k) => JSON.stringify(replay[k]) !== JSON.stringify(rebuilt[k]));
+  return { round: replay.round, ok: diff.length === 0, diff, result: rebuilt.result, events: rebuilt.events.length };
+}
+
+// Tournament from the saved replays: the same show as the live tournament, without the pauses for improvements.
+// Nothing is written to the contestants' folders.
+async function runReplay(token) {
+  const n = Math.max(1, Math.min(9, Number(params.get('rounds')) || Number($('#tourRounds').value) || 3));
+  const list = parseRounds(params.get('round'), n);
+  window.__replayChecks = [];
+  ui.score = [0, 0];
+  ui.matchEnd = null;
+  const totals = [0, 0];
+  const replays = new Map();
+  loading++;
+  try {
+    for (let k = 1; k <= Math.max(...list); k++) replays.set(k, await fetchReplay(k));
+  } catch (err) {
+    showMenu(String(err.message || err), true);
+    return;
+  } finally {
+    loading--;
+  }
+  const ciOf = (rp, side) => contestants.findIndex((c) => c.id === rp.players[side].id);
+  const count = (k) => {
+    const rp = replays.get(k);
+    if (rp.result.winner != null) ui.score[ciOf(rp, rp.result.winner)]++;
+    for (let side = 0; side < 2; side++) totals[ciOf(rp, side)] += rp.result.percent[side];
+  };
+  for (let j = 0; j < list.length; j++) {
+    const no = list[j];
+    for (let k = (j ? list[j - 1] : 0) + 1; k < no; k++) count(k); // rounds that are not shown
+    if (no > 1) {
+      // As in the live tournament: before rounds 2+ both teams (skins) are loaded from disk again.
+      try {
+        const prev = contestants;
+        const fresh = await loadPair(prev.map((c) => c.entry), prev);
+        for (const c of prev) {
+          c.host.dispose();
+          c.skin.dispose();
+        }
+        contestants = fresh;
+        R.contestants = contestants;
+      } catch (err) {
+        showMenu(String(err.message || err), true);
+        return;
+      }
+      if (token !== runToken) return;
+    }
+    const replay = replays.get(no);
+    ui.roundLabel = `РАУНД ${no} ИЗ ${n}`;
+    const res = await playRound(token, no - 1, no, replay);
+    if (!res) return;
+    const check = checkReplay(replay, res.replay);
+    window.__replayChecks.push(check);
+    if (!check.ok) console.error(`[replay] раунд ${no} разошёлся с записью: ${check.diff.join(', ')}`);
+    else console.log(`[replay] раунд ${no} совпал с записью: ${res.replay.result.percent.join(' : ')}`);
+    if (res.winnerCi != null) ui.score[res.winnerCi]++;
+    totals[0] += res.percent[0];
+    totals[1] += res.percent[1];
+    if (!(await showRoundEnd(token, res))) return;
+    if (no === n) {
+      let winner = ui.score[0] === ui.score[1] ? null : ui.score[0] > ui.score[1] ? 0 : 1;
+      if (winner == null && Math.abs(totals[0] - totals[1]) > 1e-9) winner = totals[0] > totals[1] ? 0 : 1;
+      finishMatch(winner, true);
+      return;
+    }
+  }
+  ui.phase = 'replayEnd'; // last shown round is not the last one of the tournament: the field stays
 }
 
 async function showRoundEnd(token, res) {
@@ -390,7 +549,11 @@ function loop(realNow) {
   requestAnimationFrame(loop);
   const dtReal = Math.max(0, Math.min(100, realNow - lastReal));
   lastReal = realNow;
-  const dtShow = ui.paused ? 0 : dtReal * SLOW;
+  frameBody(dtReal * SLOW);
+}
+
+function frameBody(dtIn) {
+  const dtShow = ui.paused ? 0 : dtIn;
   show += dtShow;
   for (let k = timers.length - 1; k >= 0; k--) {
     if (timers[k].at <= show) timers.splice(k, 1)[0].resolve();
@@ -423,7 +586,48 @@ function loop(realNow) {
     String(err?.stack || err).split('\n').slice(0, 6).forEach((l, i) => ctx.fillText(l.slice(0, 160), 16, 30 + i * 20));
   }
 }
-requestAnimationFrame(loop);
+if (!CAPTURE) requestAnimationFrame(loop);
+else {
+  const macrotask = () => new Promise((r) => setTimeout(r, 0));
+  const until = async (fn, ms, what) => {
+    const t0 = performance.now();
+    while (!fn()) {
+      if (performance.now() - t0 > ms) throw new Error(`capture: не дождался ${what} за ${ms} мс`);
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  };
+  window.__cap = {
+    // One frame of the show, exactly 1/60 s. Waits for loading teams first; after the frame it lets the
+    // game logic released by this frame run (microtasks) and waits for every skin worker's picture.
+    async step() {
+      await until(() => loading === 0 && ui.phase !== 'loading', 60000, 'загрузки команд');
+      frameBody(1000 / 60);
+      await macrotask();
+      await until(() => loading === 0, 60000, 'загрузки команд');
+      for (const c of contestants || []) await c.skin.idle(20000);
+      return this.state();
+    },
+    state() {
+      const round = R.round;
+      return {
+        show,
+        phase: ui.phase,
+        tick: round ? round.tick : null,
+        over: round ? round.over : null,
+        roundIndex: ui.roundIndex,
+        score: [...ui.score],
+        timeScale: R.timeScale(),
+        cam: { ...R.cam },
+        skins: (contestants || []).map((c) => ({ id: c.id, fallback: c.skin.fallback, reason: c.skin.reason, status: c.skin.status() })),
+        checks: window.__replayChecks || [],
+      };
+    },
+    get sfxLog() {
+      return sfxLog;
+    },
+    canvas: R.canvas,
+  };
+}
 
 addEventListener('keydown', (e) => {
   if (e.target.closest?.('#menu') && e.key !== 'Escape') return;
