@@ -1,6 +1,6 @@
 # Захват территории
 
-Турнир один на один в духе paper.io между командами, которые целиком создают нейросети: имя, девиз, облик (земля, хвост, персонаж, эффекты, карточка команды, анимация победы) и искусственный интеллект. Арена сделана для ролика «Sonnet 5.5 против GPT-6.1 Sol»: [[ССЫЛКА НА ВИДЕО]].
+Турнир один на один в духе paper.io между командами, которые целиком создают нейросети: имя, девиз, облик (земля, хвост, персонаж, эффекты, карточка команды, анимация победы) и искусственный интеллект. Арена сделана для ролика «Sonnet 5.5 против GPT-6.1 Sol»: https://youtu.be/_WvhZK5CO4c.
 
 Зависимостей нет, нужен только Node.js 18+.
 
@@ -118,4 +118,4 @@ node serve.mjs
 
 ## English summary
 
-Territory Arena is a paper.io-style 1v1 tournament where each team (name, motto, look, effects, victory animation and AI) is built entirely by an AI model. It was made for the video "Sonnet 5.5 vs GPT-6.1 Sol" ([[ССЫЛКА НА ВИДЕО]]). Claude Sonnet 5.5 (Claude Code) beat GPT-6.1 Sol (Codex) 3:0 (93.8% vs 1.1%, 83.5% vs 9.0%, 73.0% vs 1.0% of the field); Sonnet spent 4 h 13 min and Sol 1 h 24 min including two rounds of improvements. Both final teams and all round replays are in `contestants/`. Requires only Node.js 18+: run `node serve.mjs` and open http://localhost:4747/?a=sonnet&b=sol&replay=sonnet&rounds=3&auto=intro&autostart=4 to watch the tournament. To pit two models of your own against each other, create their workspaces with `node new-contestant.mjs <id> --model "..."` and give each agent the prompt from `prompts/territory-battle.md`. MIT license.
+Territory Arena is a paper.io-style 1v1 tournament where each team (name, motto, look, effects, victory animation and AI) is built entirely by an AI model. It was made for the video "Sonnet 5.5 vs GPT-6.1 Sol" (https://youtu.be/_WvhZK5CO4c). Claude Sonnet 5.5 (Claude Code) beat GPT-6.1 Sol (Codex) 3:0 (93.8% vs 1.1%, 83.5% vs 9.0%, 73.0% vs 1.0% of the field); Sonnet spent 4 h 13 min and Sol 1 h 24 min including two rounds of improvements. Both final teams and all round replays are in `contestants/`. Requires only Node.js 18+: run `node serve.mjs` and open http://localhost:4747/?a=sonnet&b=sol&replay=sonnet&rounds=3&auto=intro&autostart=4 to watch the tournament. To pit two models of your own against each other, create their workspaces with `node new-contestant.mjs <id> --model "..."` and give each agent the prompt from `prompts/territory-battle.md`. MIT license.
