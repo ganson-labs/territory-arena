@@ -1,7 +1,8 @@
 // Static server for the viewer, team discovery and saving round files. No dependencies.
 //   node serve.mjs [--port 4747]
-// Contestants live outside the arena (see new-contestant.mjs). They are found in arena.config.json
-// or passed as absolute paths in the viewer link (?a=C:/arena-sonnet). Their files are served
+// Contestants live outside the arena (see new-contestant.mjs). They are found in arena.config.json,
+// in contestants/<id>/ (teams shipped with the arena, read-only) or passed as absolute paths in the
+// viewer link (?a=C:/arena-sonnet). Their files are served
 // under /team/<key>/, round files are written to <their folder>/rounds/.
 import { createServer } from 'node:http';
 import { readFile, readdir, stat, mkdir, writeFile } from 'node:fs/promises';
@@ -76,6 +77,14 @@ async function listBots(extra = []) {
   }
   const cfg = await readJson(join(root, 'arena.config.json'));
   const teams = Object.entries(cfg.contestants || {}).map(([id, c]) => ({ key: id, dir: c.dir, model: c.model, color: c.color }));
+  // Teams shipped with the arena (contestants/<id>/, e.g. the tournament from the video): read-only,
+  // so a live match never overwrites their recorded rounds.
+  const bundled = join(root, 'contestants');
+  if (existsSync(bundled)) {
+    for (const name of (await readdir(bundled)).sort()) {
+      if (!teams.some((t) => t.key === name)) teams.push({ key: name, dir: join(bundled, name), readOnly: true });
+    }
+  }
   for (const p of extra) teams.push({ key: p, dir: p });
   for (const t of teams) {
     const dir = resolve(String(t.dir || ''));
@@ -91,7 +100,7 @@ async function listBots(extra = []) {
       color: meta.color || t.color || '#e0e0e0',
       hasSkin: existsSync(join(dir, 'bot', 'skin.js')),
       assets: await listAssets(join(dir, 'bot'), `${base}bot/`),
-      saveable: true,
+      saveable: !t.readOnly,
     });
   }
   return bots;

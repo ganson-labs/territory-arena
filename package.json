@@ -1,6 +1,7 @@
 {
   "name": "territory-arena",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Захват территории: турнир ботов, написанных нейросетями",
   "scripts": {

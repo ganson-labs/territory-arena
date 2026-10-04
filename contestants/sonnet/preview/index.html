@@ -1,0 +1,254 @@
+<!doctype html>
+<!-- Стенд облика: гоняет настоящий движок и bot/bot.js, а bot/skin.js рисует в Web Worker на OffscreenCanvas, как на арене.
+     Запуск: из корня папки `python -m http.server 8123` и открыть http://localhost:8123/preview/index.html
+     Параметры: mode=arena|intro|victory, tick=N (прокрутить), auto=0 (кадры вручную), unit=0.6 (масштаб камеры), cs=2 (4K-холст карточек),
+     vs=raider|farmer|bot, p=61.4 (доля для победы). Консоль: __ctl.advance(сек), runUntil('capture'), fake('kill',x,y), seek(t);
+     __shot(имя) / __crop(имя,x,y,w,h,k) шлют PNG на preview/saver.mjs (node preview/saver.mjs) в preview/shots. -->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Стенд облика</title>
+<style>
+  html,body{margin:0;background:#07080c;color:#9aa;font:12px/1.4 ui-monospace,Consolas,monospace;overflow:auto}
+  #wrap{position:relative;display:inline-block}
+  canvas{display:block;background:#0b0d13}
+  #hud{position:absolute;left:8px;top:6px;pointer-events:none;text-shadow:0 0 3px #000;color:#cfd6e4}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas><div id="hud"></div></div>
+<script type="module">
+import { createRound, stepRound, botView, MAPS, COLS, ROWS, CELLS, percentOf, ROUND_TICKS } from '../arena/engine.js';
+import { ringsFromCells } from './contours.js';
+
+const q = new URLSearchParams(location.search);
+const mode = q.get('mode') || 'arena';
+const vsName = q.get('vs') || 'raider';
+const mapIndex = +(q.get('map') ?? 0);
+const swap = q.get('swap') === '1';
+const mySide = swap ? 1 : 0;
+const startTick = +(q.get('tick') ?? 0);
+let paused = q.get('pause') === '1';
+let speed = +(q.get('speed') ?? 1);
+const freezeT = q.get('t') != null ? +q.get('t') : null;
+const pct = +(q.get('p') ?? 54.3);
+const viewScale = +(q.get('vs_scale') ?? 1);
+const UNIT = +(q.get('unit') ?? 1);
+const CS = +(q.get('cs') ?? 1);
+
+const team = await (await fetch('../bot/team.json')).json();
+const canvas = document.getElementById('c');
+const g = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+window.__crop = async (name, x, y, w, h, k = 3) => { const c2 = document.createElement('canvas'); c2.width = w * k; c2.height = h * k; const g2 = c2.getContext('2d'); g2.imageSmoothingQuality = 'high'; g2.drawImage(canvas, x, y, w, h, 0, 0, w * k, h * k); const b = await new Promise((r) => c2.toBlob(r, 'image/png')); const r = await fetch('http://localhost:8124/save?name=' + name, { method: 'POST', body: b }); return r.status; };
+window.__shot = async (name) => { const b = await new Promise((r) => canvas.toBlob(r, 'image/png')); const r = await fetch('http://localhost:8124/save?name=' + name, { method: 'POST', body: b }); return r.status; };
+
+const size = mode === 'arena' ? [Math.round(1600 * UNIT), Math.round(1000 * UNIT)] : mode === 'intro' ? [840 * CS, 860 * CS] : [1152 * CS, 648 * CS];
+canvas.width = size[0];
+canvas.height = size[1];
+canvas.style.width = Math.round(size[0] * viewScale) + 'px';
+canvas.style.height = Math.round(size[1] * viewScale) + 'px';
+
+// ---- облик в Worker
+const worker = new Worker('./skinworker.js', { type: 'module' });
+let skinReady = false;
+let lastBitmap = null;
+let msSum = 0, msN = 0, msMax = 0;
+let bitmapWaiter = null;
+window.__slow = [];
+let curInfo = '';
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'ready') skinReady = true;
+  else if (m.type === 'bitmap') {
+    if (bitmapWaiter) { const w = bitmapWaiter; bitmapWaiter = null; setTimeout(() => w(), 0); }
+    if (lastBitmap) lastBitmap.close?.();
+    lastBitmap = m.bmp;
+    msSum += m.ms; msN++; msMax = Math.max(msMax, m.ms);
+    if (m.ms > 5) window.__slow.push({ ms: +m.ms.toFixed(1), info: curInfo });
+    if (msN > 120) { msSum = msSum / msN * 60; msN = 60; }
+  } else if (m.type === 'error') console.error('skin error', m.msg);
+};
+worker.postMessage({ type: 'init', url: new URL('../bot/skin.js?v=' + Date.now(), location.href).href });
+while (!skinReady) await new Promise((r) => setTimeout(r, 20));
+
+// ---- режимы intro / victory
+const postAndWait = (f) => new Promise((res) => { bitmapWaiter = res; worker.postMessage({ type: 'frame', f }); });
+if (mode !== 'arena') {
+  let tNow = 0;
+  const bg = mode === 'intro' ? '#10121a' : '#0c0e14';
+  async function renderAt(t, dt) {
+    await postAndWait({ mode, t, dt, width: size[0], height: size[1], color: team.color, accent: team.accent, name: team.name, motto: team.motto, percent: pct });
+    g.fillStyle = bg;
+    g.fillRect(0, 0, size[0], size[1]);
+    if (lastBitmap) g.drawImage(lastBitmap, 0, 0);
+    hud.textContent = `${mode} t=${t.toFixed(2)}  draw avg ${(msSum / Math.max(1, msN)).toFixed(2)}ms max ${msMax.toFixed(1)}ms`;
+  }
+  async function seek(t) {
+    tNow = 0;
+    while (tNow < t - 1e-6) { tNow = Math.min(t, tNow + 1 / 60); await renderAt(tNow, 1 / 60); }
+  }
+  window.__ctl = { seek, renderAt, msMax: () => msMax };
+  if (freezeT != null) await seek(freezeT);
+  else await seek(0.02);
+  if (q.get('auto') !== '0' && freezeT == null) {
+    const t0 = performance.now();
+    const loop = async () => { const t = ((performance.now() - t0) / 1000) % 7; await renderAt(t, 1 / 60); setTimeout(loop, 16); };
+    loop();
+  }
+} else {
+  // ---- арена
+  const myBot = (await import('../bot/bot.js?v=' + Date.now())).default;
+  const vsPath = vsName === 'bot' ? '../bot/bot.js?instance=1' : `../arena/sparring/${vsName}/bot.js`;
+  const foeBot = (await import(vsPath)).default;
+  const bots = mySide === 0 ? [myBot, foeBot] : [foeBot, myBot];
+  const round = createRound({ mapIndex });
+  for (let s = 0; s < 2; s++) bots[s].init?.({ round: 0, side: s, mapName: round.map.name, view: botView(round, s) });
+
+  const me = () => round.players[mySide];
+  const foe = () => round.players[1 - mySide];
+  let pending = [];
+  let landRings = [Float32Array.from([])], enemyRings = [];
+  let landDirty = true;
+  const cache = { my: [], en: [] };
+  let prevPos = null, curPos = null, tickTime = performance.now();
+
+  function tick1() {
+    const acts = [0, 1].map((s) => bots[s].tick(botView(round, s)));
+    const prevMine = { x: me().x, y: me().y, alive: me().alive }, prevFoe = { x: foe().x, y: foe().y, alive: foe().alive };
+    const ev = stepRound(round, acts);
+    for (const e of ev) {
+      if (e.type === 'capture' && e.side === mySide) {
+        pending.push({ type: 'capture', x: e.x, y: e.y, percent: percentOf(round, mySide), cells: e.count, _cells: e.cells });
+        landDirty = true;
+      } else if (e.type === 'capture') landDirty = true;
+      else if (e.type === 'death') {
+        landDirty = true;
+        if (e.side === mySide) pending.push({ type: 'death', x: e.x, y: e.y, cause: e.cause });
+        else if (e.by === mySide || e.cause === 'cut') pending.push({ type: 'kill', x: e.cutAt?.x ?? e.x, y: e.cutAt?.y ?? e.y, cause: e.cause });
+        if (e.side !== mySide && e.by !== mySide) { /* соперник сам */ }
+      } else if (e.type === 'respawn') {
+        landDirty = true;
+        if (e.side === mySide) pending.push({ type: 'respawn', x: e.x, y: e.y });
+      }
+    }
+    prevPos = { x: prevMine.x, y: prevMine.y };
+    curPos = { x: me().x, y: me().y };
+    tickTime = performance.now();
+    return ev;
+  }
+  function rebuild() {
+    const L = round.land;
+    cache.my = ringsFromCells((i) => L[i] === mySide, COLS, ROWS, 10);
+    cache.en = ringsFromCells((i) => L[i] === 1 - mySide, COLS, ROWS, 10);
+    landDirty = false;
+  }
+  function areaRings(cells) {
+    const set = new Set(cells);
+    return ringsFromCells((i) => set.has(i), COLS, ROWS, 10);
+  }
+
+  const ff = (n) => { for (let i = 0; i < n && !round.over; i++) tick1(); };
+  const runUntil = (type, maxTicks = 4000) => {
+    for (let i = 0; i < maxTicks && !round.over; i++) {
+      tick1();
+      if (pending.some((e) => e.type === type)) return round.tick;
+    }
+    return -1;
+  };
+  ff(startTick);
+  pending = [];
+  window.__ctl = {
+    pause() { paused = true; }, play() { paused = false; },
+    speed(n) { speed = n; }, ff, runUntil, round,
+    state: () => ({ tick: round.tick, me: percentOf(round, mySide), foe: percentOf(round, 1 - mySide) }),
+    clearPending() { pending = []; },
+  };
+
+  let tSkin = 0;
+  const scA = (a) => { const o = new Float32Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] * UNIT; return o; };
+  async function renderFrame(dt) {
+    if (landDirty) rebuild();
+    const m = me(), e = foe();
+    const alpha = 1;
+    const hx = m.x, hy = m.y;
+    const trailPts = [];
+    for (const p of m.trail) trailPts.push(p.x, p.y);
+    const base = round.map.bases[mySide];
+    const events = pending.map((ev) => ev.type === 'capture' ? { ...ev, x: ev.x * UNIT, y: ev.y * UNIT, area: areaRings(ev._cells).map(scA), _cells: undefined } : { ...ev, x: ev.x * UNIT, y: ev.y * UNIT });
+    pending = [];
+    const f = {
+      mode: 'arena', t: tSkin, dt, width: size[0], height: size[1], unit: UNIT,
+      color: team.color, accent: team.accent, name: team.name, motto: team.motto,
+      land: cache.my.map(scA), base: { x: base.x * UNIT, y: base.y * UNIT, r: 60 * UNIT },
+      trail: scA(Float32Array.from(trailPts)),
+      head: { x: hx * UNIT, y: hy * UNIT, heading: m.heading, speed: 200 * UNIT, alive: m.alive, respawnIn: m.respawnIn, home: m.alive && round.land[Math.floor(m.y / 10) * COLS + Math.floor(m.x / 10)] === mySide },
+      percent: percentOf(round, mySide), enemyPercent: percentOf(round, 1 - mySide), timeLeft: Math.max(0, 120 - round.tick / 20),
+      enemy: { head: { x: e.x * UNIT, y: e.y * UNIT, heading: e.heading, alive: e.alive }, color: '#ff5a6e' },
+      events,
+    };
+    curInfo = 'tick ' + round.tick + ' t=' + tSkin.toFixed(2) + ' ev=' + events.map((e) => e.type).join(',') + ' land=' + cache.my.reduce((a, r) => a + r.length, 0);
+    await postAndWait(f);
+    g.save();
+    g.scale(UNIT, UNIT);
+    g.fillStyle = '#0b0d13';
+    g.fillRect(0, 0, 1600, 1000);
+    g.strokeStyle = 'rgba(255,255,255,0.04)';
+    g.lineWidth = 1;
+    g.beginPath();
+    for (let x = 0; x <= 1600; x += 100) { g.moveTo(x, 0); g.lineTo(x, 1000); }
+    for (let y = 0; y <= 1000; y += 100) { g.moveTo(0, y); g.lineTo(1600, y); }
+    g.stroke();
+    g.beginPath();
+    for (const ring of cache.en) { g.moveTo(ring[0], ring[1]); for (let i = 2; i < ring.length; i += 2) g.lineTo(ring[i], ring[i + 1]); g.closePath(); }
+    g.fillStyle = 'rgba(255,90,110,0.30)';
+    g.fill('evenodd');
+    g.strokeStyle = 'rgba(255,120,140,0.7)';
+    g.lineWidth = 1.5;
+    g.stroke();
+    if (e.trail.length > 1) {
+      g.beginPath();
+      g.moveTo(e.trail[0].x, e.trail[0].y);
+      for (const p of e.trail) g.lineTo(p.x, p.y);
+      g.strokeStyle = '#ff8fa0';
+      g.lineWidth = 5;
+      g.stroke();
+    }
+    if (e.alive) { g.fillStyle = '#ff5a6e'; g.beginPath(); g.arc(e.x, e.y, 13, 0, 7); g.fill(); }
+    g.restore();
+    if (lastBitmap) g.drawImage(lastBitmap, 0, 0);
+    hud.textContent = `tick ${round.tick}  me ${percentOf(round, mySide).toFixed(1)}%  foe ${percentOf(round, 1 - mySide).toFixed(1)}%  draw avg ${(msSum / Math.max(1, msN)).toFixed(2)}ms max ${msMax.toFixed(1)}ms`;
+  }
+  // детерминированный прогон: sec секунд показа при 60 кадрах/с, симуляция 20 ходов/с
+  let frameN = 0;
+  async function advance(sec, simOn = true) {
+    const n = Math.round(sec * 60);
+    for (let i = 0; i < n; i++) {
+      frameN++;
+      if (simOn && frameN % 3 === 0 && !round.over) tick1();
+      tSkin += 1 / 60;
+      await renderFrame(1 / 60);
+    }
+  }
+  window.__ctl.advance = advance;
+  window.__ctl.fake = (type, x, y, extra = {}) => pending.push({ type, x, y, cause: 'cut', ...extra });
+  window.__ctl.render = () => renderFrame(1 / 60);
+  window.__ctl.msMax = () => msMax;
+  await renderFrame(1 / 60);
+  if (q.get('auto') === '1') {
+    let last = performance.now(), acc = 0;
+    const loop = async () => {
+      const now = performance.now();
+      const dtMs = Math.min(100, now - last);
+      last = now;
+      if (!paused) { acc += dtMs * speed; while (acc >= 50) { acc -= 50; tick1(); } }
+      tSkin += dtMs / 1000;
+      await renderFrame(dtMs / 1000);
+      setTimeout(loop, 16);
+    };
+    loop();
+  }
+}
+</script>
+</body>
+</html>

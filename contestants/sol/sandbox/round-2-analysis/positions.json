@@ -1,0 +1,312 @@
+[
+  {
+    "t": 62,
+    "me": [
+      1062,
+      390,
+      306
+    ],
+    "enemy": [
+      744,
+      539,
+      285
+    ],
+    "home": true,
+    "trails": [
+      0,
+      1
+    ],
+    "nearest": 351,
+    "threat": null,
+    "land": [
+      26.5,
+      53.8
+    ],
+    "forecast": null,
+    "plan": {
+      "total": 26,
+      "left": 24,
+      "attack": false,
+      "approach": false,
+      "escape": false,
+      "sweep": false,
+      "margin": 69
+    }
+  },
+  {
+    "t": 62.5,
+    "me": [
+      1143,
+      407,
+      66
+    ],
+    "enemy": [
+      747,
+      439,
+      280
+    ],
+    "home": false,
+    "trails": [
+      1,
+      11
+    ],
+    "nearest": 397,
+    "threat": 394,
+    "land": [
+      26.5,
+      53.8
+    ],
+    "forecast": {
+      "ticks": 20,
+      "lost": 201
+    },
+    "plan": {
+      "total": 14,
+      "left": 13,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": 193
+    }
+  },
+  {
+    "t": 63,
+    "me": [
+      1090,
+      476,
+      174
+    ],
+    "enemy": [
+      757,
+      340,
+      275
+    ],
+    "home": false,
+    "trails": [
+      13,
+      21
+    ],
+    "nearest": 344,
+    "threat": 360,
+    "land": [
+      26.5,
+      53.8
+    ],
+    "forecast": {
+      "ticks": 21,
+      "lost": 43
+    },
+    "plan": {
+      "total": 5,
+      "left": 4,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": 312
+    }
+  },
+  {
+    "t": 63.5,
+    "me": [
+      1039,
+      408,
+      285
+    ],
+    "enemy": [
+      767,
+      240,
+      275
+    ],
+    "home": true,
+    "trails": [
+      0,
+      32
+    ],
+    "nearest": 288,
+    "threat": null,
+    "land": [
+      26.9,
+      53.4
+    ],
+    "forecast": {
+      "ticks": 12,
+      "lost": 43
+    },
+    "plan": {
+      "total": 38,
+      "left": 32,
+      "attack": false,
+      "approach": false,
+      "escape": false,
+      "sweep": false,
+      "margin": 55
+    }
+  },
+  {
+    "t": 64,
+    "me": [
+      1123,
+      394,
+      26
+    ],
+    "enemy": [
+      777,
+      141,
+      275
+    ],
+    "home": true,
+    "trails": [
+      0,
+      43
+    ],
+    "nearest": 370,
+    "threat": null,
+    "land": [
+      26.9,
+      53.4
+    ],
+    "forecast": {
+      "ticks": 8,
+      "lost": 1609
+    },
+    "plan": null
+  },
+  {
+    "t": 64.5,
+    "me": [
+      1204,
+      438,
+      71
+    ],
+    "enemy": [
+      856,
+      113,
+      31
+    ],
+    "home": false,
+    "trails": [
+      9,
+      0
+    ],
+    "nearest": null,
+    "threat": 405,
+    "land": [
+      16.8,
+      64.2
+    ],
+    "forecast": null,
+    "plan": {
+      "total": 53,
+      "left": 50,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": -166
+    }
+  },
+  {
+    "t": 65,
+    "me": [
+      1143,
+      494,
+      189
+    ],
+    "enemy": [
+      914,
+      190,
+      38
+    ],
+    "home": false,
+    "trails": [
+      21,
+      0
+    ],
+    "nearest": null,
+    "threat": 309,
+    "land": [
+      16.8,
+      64.2
+    ],
+    "forecast": null,
+    "plan": {
+      "total": 53,
+      "left": 40,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": -166
+    }
+  },
+  {
+    "t": 65.5,
+    "me": [
+      1045,
+      478,
+      189
+    ],
+    "enemy": [
+      992,
+      254,
+      39
+    ],
+    "home": false,
+    "trails": [
+      33,
+      0
+    ],
+    "nearest": null,
+    "threat": 210,
+    "land": [
+      16.8,
+      64.2
+    ],
+    "forecast": null,
+    "plan": {
+      "total": 53,
+      "left": 30,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": -166
+    }
+  },
+  {
+    "t": 66,
+    "me": [
+      946,
+      461,
+      189
+    ],
+    "enemy": [
+      1069,
+      317,
+      39
+    ],
+    "home": false,
+    "trails": [
+      44,
+      0
+    ],
+    "nearest": null,
+    "threat": 110,
+    "land": [
+      16.8,
+      64.2
+    ],
+    "forecast": null,
+    "plan": {
+      "total": 53,
+      "left": 20,
+      "attack": false,
+      "approach": false,
+      "escape": true,
+      "sweep": false,
+      "margin": -166
+    }
+  }
+]
